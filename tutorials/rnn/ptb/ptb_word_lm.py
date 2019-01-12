@@ -642,9 +642,9 @@ def get_config():
     config = TestConfig()
   elif FLAGS.model == "newtest":
     config = NewTestConfig()
-  elif FLAGS.model == "non-tied":
+  elif FLAGS.model == "nontied":
     config = NewMediumConfig
-  elif FLAGS.model == "tied+l":
+  elif FLAGS.model == "tiedl":
     config = TiedNewMediumConfig()
   else:
     raise ValueError("Invalid model: %s", FLAGS.model)
