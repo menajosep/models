@@ -636,13 +636,15 @@ def get_config():
     config = MediumConfig()
   elif FLAGS.model == "large":
     config = LargeConfig()
+  elif FLAGS.model == "baseline":
+    config = LargeConfig()
   elif FLAGS.model == "test":
     config = TestConfig()
   elif FLAGS.model == "newtest":
     config = NewTestConfig()
-  elif FLAGS.model == "newMedium":
+  elif FLAGS.model == "non-tied":
     config = NewMediumConfig
-  elif FLAGS.model == "tiedNewMedium":
+  elif FLAGS.model == "tied+l":
     config = TiedNewMediumConfig()
   else:
     raise ValueError("Invalid model: %s", FLAGS.model)
