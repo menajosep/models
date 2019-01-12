@@ -68,6 +68,8 @@ import reader
 import util
 
 from tensorflow.python.client import device_lib
+from tensorflow.python.ops import array_ops, nn_ops, math_ops
+from tensorflow.contrib import distributions
 
 flags = tf.flags
 logging = tf.logging
@@ -120,12 +122,13 @@ class PTBModel(object):
     self._cell = None
     self.batch_size = input_.batch_size
     self.num_steps = input_.num_steps
-    size = config.hidden_size
-    vocab_size = config.vocab_size
+    self.embedding_size = config.embedding_size
+    self.size = config.hidden_size
+    self.vocab_size = config.vocab_size
 
     with tf.device("/cpu:0"):
       embedding = tf.get_variable(
-          "embedding", [vocab_size, size], dtype=data_type())
+          "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
       inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
 
     if is_training and config.keep_prob < 1:
@@ -133,23 +136,39 @@ class PTBModel(object):
 
     output, state = self._build_rnn_graph(inputs, config, is_training)
 
-    softmax_w = tf.get_variable(
-        "softmax_w", [size, vocab_size], dtype=data_type())
-    softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=data_type())
-    logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
+    if config.tie_embeddings:
+      if config.use_projection:
+        linear_w = tf.get_variable(
+          "linear_w", [self.size, self.embedding_size], dtype=data_type())
+        linear_b = tf.get_variable("linear_b", [self.embedding_size], dtype=data_type())
+        projected_output = tf.nn.xw_plus_b(output, linear_w, linear_b)
+        logits = tf.matmul(projected_output, tf.transpose(embedding))
+      else:
+        logits = tf.matmul(output, tf.transpose(embedding))
+    else:
+      softmax_w = tf.get_variable(
+          "softmax_w", [self.size, self.vocab_size], dtype=data_type())
+      softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
+      logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
      # Reshape logits to be a 3-D tensor for sequence loss
-    logits = tf.reshape(logits, [self.batch_size, self.num_steps, vocab_size])
+    logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
     # Use the contrib sequence loss and average over the batches
-    loss = tf.contrib.seq2seq.sequence_loss(
-        logits,
-        input_.targets,
-        tf.ones([self.batch_size, self.num_steps], dtype=data_type()),
-        average_across_timesteps=False,
-        average_across_batch=True)
+    # loss = tf.contrib.seq2seq.sequence_loss(
+    #     logits,
+    #     input_.targets,
+    #     tf.ones([self.batch_size, self.num_steps], dtype=data_type()),
+    #     average_across_timesteps=False,
+    #     average_across_batch=True)
+    if config.get_uncertainties:
+      crossent, loss = self.crossentropy_loss_with_uncert(output, logits, input_.targets)
+    else:
+      loss = self.crossentropy_loss(logits, input_.targets)
+      crossent = loss
 
     # Update the cost
-    self._cost = tf.reduce_sum(loss)
+    self._loss = tf.reduce_sum(loss)
+    self._cost = tf.reduce_sum(crossent)
     self._final_state = state
 
     if not is_training:
@@ -157,7 +176,7 @@ class PTBModel(object):
 
     self._lr = tf.Variable(0.0, trainable=False)
     tvars = tf.trainable_variables()
-    grads, _ = tf.clip_by_global_norm(tf.gradients(self._cost, tvars),
+    grads, _ = tf.clip_by_global_norm(tf.gradients(self._loss, tvars),
                                       config.max_grad_norm)
     optimizer = tf.train.GradientDescentOptimizer(self._lr)
     self._train_op = optimizer.apply_gradients(
@@ -167,6 +186,92 @@ class PTBModel(object):
     self._new_lr = tf.placeholder(
         tf.float32, shape=[], name="new_learning_rate")
     self._lr_update = tf.assign(self._lr, self._new_lr)
+
+  def crossentropy_loss(self, logits, targets):
+    num_classes = array_ops.shape(logits)[2]
+    logits_flat = array_ops.reshape(logits, [-1, num_classes])
+    targets = array_ops.reshape(targets, [-1])
+    crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+        labels=targets, logits=logits_flat)
+    batch_size = array_ops.shape(logits)[0]
+    sequence_length = array_ops.shape(logits)[1]
+    crossent = array_ops.reshape(crossent, [batch_size, sequence_length])
+    crossent = math_ops.reduce_mean(crossent, axis=[0])
+    return crossent
+
+  def crossentropy_loss_with_uncert(self, output, logits, targets):
+    T = 10
+    self.variance = tf.layers.dense(
+      tf.reshape(output, [-1, self.size]),
+      1,
+      name="variance",
+      use_bias=False,
+      activation=tf.nn.softplus)
+    std = tf.sqrt(self.variance)
+    variance_depressor = tf.exp(self.variance) - tf.ones_like(self.variance)
+    variance_depressor = tf.cast(variance_depressor, tf.float64)
+    num_classes = array_ops.shape(logits)[2]
+    logits_flat = array_ops.reshape(logits, [-1, num_classes])
+    targets = array_ops.reshape(targets, [-1])
+    crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+        labels=targets, logits=logits_flat)
+    crossent = tf.cast(crossent, tf.float64)
+    # shape: (T,)
+    iterable = tf.Variable(np.ones(T))
+    dist = distributions.Normal(loc=tf.zeros_like(std), scale=std)
+    monte_carlo_results = tf.map_fn(
+      self.gaussian_categorical_crossentropy(
+        targets,
+        logits,
+        dist,
+        crossent,
+        self.vocab_size
+      ),
+      iterable, name='monte_carlo_results'
+    )
+    monte_carlo_results_mean = tf.reduce_mean(monte_carlo_results, axis=0)
+
+    variance_loss = tf.multiply(
+      monte_carlo_results_mean,
+      crossent
+    )
+
+    bayesian_categorical_crossentropy = (
+            variance_loss + crossent + variance_depressor
+    )
+    categorical_crossentropy_weight = 1.
+    bayesian_categorical_crossentropy_weight = .2
+    final_loss = tf.reduce_mean(
+      categorical_crossentropy_weight * crossent +
+      bayesian_categorical_crossentropy_weight * bayesian_categorical_crossentropy
+    )
+
+    return crossent, final_loss
+
+    # for a single monte carlo simulation,
+    #   calculate categorical_crossentropy of
+    #   predicted logit values plus gaussian
+    #   noise vs true values.
+    # true - true values. Shape: (N, C)
+    # pred - predicted logit values. Shape: (N, C)
+    # dist - normal distribution to sample from. Shape: (N, C)
+    # undistorted_loss - the crossentropy loss without variance distortion. Shape: (N,)
+    # num_classes - the number of classes. C
+    # returns - total differences for all classes (N,)
+  def gaussian_categorical_crossentropy(self, true, pred, dist, undistorted_loss, num_classes):
+    def map_fn(i):
+      std_samples = tf.transpose(dist.sample(num_classes))
+      std_samples = tf.reshape(std_samples, [-1, 1, num_classes])
+      distorted_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=true,
+        logits=pred + std_samples,
+        name="sparse_softmax_cross_entropy_with_logits"
+      )
+      distorted_loss = tf.cast(distorted_loss, tf.float64)
+      diff = undistorted_loss - distorted_loss
+      return -tf.nn.elu(diff)
+
+    return map_fn
 
   def _build_rnn_graph(self, inputs, config, is_training):
     if config.rnn_mode == CUDNN:
@@ -231,15 +336,18 @@ class PTBModel(object):
     #
     # The alternative version of the code below is:
     #
-    # inputs = tf.unstack(inputs, num=self.num_steps, axis=1)
-    # outputs, state = tf.nn.static_rnn(cell, inputs,
-    #                                   initial_state=self._initial_state)
-    outputs = []
-    with tf.variable_scope("RNN"):
-      for time_step in range(self.num_steps):
-        if time_step > 0: tf.get_variable_scope().reuse_variables()
-        (cell_output, state) = cell(inputs[:, time_step, :], state)
-        outputs.append(cell_output)
+    inputs = tf.unstack(inputs, num=self.num_steps, axis=1)
+    # sze of outputs  (batch_size, num_steps, hidden_size)
+    outputs, state = tf.nn.static_rnn(cell, inputs,
+                                      initial_state=self._initial_state)
+    # outputs = []
+    # with tf.variable_scope("RNN"):
+    #   for time_step in range(self.num_steps):
+    #     if time_step > 0: tf.get_variable_scope().reuse_variables()
+    #     (cell_output, state) = cell(inputs[:, time_step, :], state)
+    #     outputs.append(cell_output)
+
+    # reshape to (batch_size * num_steps, hidden_size)
     output = tf.reshape(tf.concat(outputs, 1), [-1, config.hidden_size])
     return output, state
 
@@ -325,6 +433,7 @@ class SmallConfig(object):
   num_layers = 2
   num_steps = 20
   hidden_size = 200
+  embedding_size = 200
   max_epoch = 4
   max_max_epoch = 13
   keep_prob = 1.0
@@ -332,6 +441,9 @@ class SmallConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
 
 
 class MediumConfig(object):
@@ -342,6 +454,7 @@ class MediumConfig(object):
   num_layers = 2
   num_steps = 35
   hidden_size = 650
+  embedding_size = 650
   max_epoch = 6
   max_max_epoch = 39
   keep_prob = 0.5
@@ -349,6 +462,71 @@ class MediumConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
+
+
+class NewMediumConfig(object):
+  """Medium config."""
+  init_scale = 0.05
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 600
+  embedding_size = 400
+  max_epoch = 6
+  max_max_epoch = 39
+  keep_prob = 0.5
+  lr_decay = 0.8
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
+
+
+class TiedNewMediumConfig(object):
+  """Medium config."""
+  init_scale = 0.05
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 600
+  embedding_size = 400
+  max_epoch = 6
+  max_max_epoch = 39
+  keep_prob = 0.5
+  lr_decay = 0.8
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = True
+  use_projection = True
+  get_uncertainties = False
+
+class MediumConfig(object):
+  """Medium config."""
+  init_scale = 0.05
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 650
+  embedding_size = 650
+  max_epoch = 6
+  max_max_epoch = 39
+  keep_prob = 0.5
+  lr_decay = 0.8
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
 
 
 class LargeConfig(object):
@@ -359,6 +537,7 @@ class LargeConfig(object):
   num_layers = 2
   num_steps = 35
   hidden_size = 1500
+  embedding_size = 1500
   max_epoch = 14
   max_max_epoch = 55
   keep_prob = 0.35
@@ -366,6 +545,9 @@ class LargeConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
 
 
 class TestConfig(object):
@@ -376,6 +558,7 @@ class TestConfig(object):
   num_layers = 1
   num_steps = 2
   hidden_size = 2
+  embedding_size = 2
   max_epoch = 1
   max_max_epoch = 1
   keep_prob = 1.0
@@ -383,6 +566,29 @@ class TestConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
+
+class NewTestConfig(object):
+  """Tiny config, for testing."""
+  init_scale = 0.1
+  learning_rate = 1.0
+  max_grad_norm = 1
+  num_layers = 1
+  num_steps = 2
+  hidden_size = 4
+  embedding_size = 2
+  max_epoch = 1
+  max_max_epoch = 1
+  keep_prob = 1.0
+  lr_decay = 0.5
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = False
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
@@ -432,6 +638,12 @@ def get_config():
     config = LargeConfig()
   elif FLAGS.model == "test":
     config = TestConfig()
+  elif FLAGS.model == "newtest":
+    config = NewTestConfig()
+  elif FLAGS.model == "newMedium":
+    config = NewMediumConfig
+  elif FLAGS.model == "tiedNewMedium":
+    config = TiedNewMediumConfig()
   else:
     raise ValueError("Invalid model: %s", FLAGS.model)
   if FLAGS.rnn_mode:
