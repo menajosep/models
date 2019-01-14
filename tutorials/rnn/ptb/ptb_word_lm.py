@@ -68,7 +68,6 @@ import reader
 import util
 
 from tensorflow.python.client import device_lib
-from tensorflow.python.ops import array_ops, nn_ops, math_ops
 from tensorflow.contrib import distributions
 
 flags = tf.flags
@@ -150,7 +149,7 @@ class PTBModel(object):
           "softmax_w", [self.size, self.vocab_size], dtype=data_type())
       softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
       logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
-     # Reshape logits to be a 3-D tensor for sequence loss
+    # Reshape logits to be a 3-D tensor for sequence loss
     logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
     # Use the contrib sequence loss and average over the batches
@@ -187,33 +186,35 @@ class PTBModel(object):
         tf.float32, shape=[], name="new_learning_rate")
     self._lr_update = tf.assign(self._lr, self._new_lr)
 
+  def print_shape(self, tensor):
+    print('{} with shape {}'.format(tensor.name, tensor.get_shape()))
+
   def crossentropy_loss(self, logits, targets):
-    num_classes = array_ops.shape(logits)[2]
-    logits_flat = array_ops.reshape(logits, [-1, num_classes])
-    targets = array_ops.reshape(targets, [-1])
-    crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+    num_classes = tf.shape(logits)[2]
+    logits_flat = tf.reshape(logits, [-1, num_classes])
+    targets = tf.reshape(targets, [-1])
+    crossent = tf.sparse_softmax_cross_entropy_with_logits(
         labels=targets, logits=logits_flat)
-    batch_size = array_ops.shape(logits)[0]
-    sequence_length = array_ops.shape(logits)[1]
-    crossent = array_ops.reshape(crossent, [batch_size, sequence_length])
-    crossent = math_ops.reduce_mean(crossent, axis=[0])
+    batch_size = tf.shape(logits)[0]
+    sequence_length = tf.shape(logits)[1]
+    crossent = tf.reshape(crossent, [batch_size, sequence_length])
+    crossent = tf.reduce_mean(crossent, axis=[0])
     return crossent
 
   def crossentropy_loss_with_uncert(self, output, logits, targets):
     T = 10
     self.variance = tf.layers.dense(
-      tf.reshape(output, [-1, self.size]),
+      output,
       1,
       name="variance",
-      use_bias=False,
       activation=tf.nn.softplus)
     std = tf.sqrt(self.variance)
     variance_depressor = tf.exp(self.variance) - tf.ones_like(self.variance)
     variance_depressor = tf.cast(variance_depressor, tf.float64)
-    num_classes = array_ops.shape(logits)[2]
-    logits_flat = array_ops.reshape(logits, [-1, num_classes])
-    targets = array_ops.reshape(targets, [-1])
-    crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+    variance_depressor = tf.reshape(variance_depressor, [-1])
+    logits_flat = tf.reshape(logits, [-1, self.vocab_size])
+    targets = tf.reshape(targets, [-1])
+    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
         labels=targets, logits=logits_flat)
     crossent = tf.cast(crossent, tf.float64)
     # shape: (T,)
@@ -222,7 +223,7 @@ class PTBModel(object):
     monte_carlo_results = tf.map_fn(
       self.gaussian_categorical_crossentropy(
         targets,
-        logits,
+        logits_flat,
         dist,
         crossent,
         self.vocab_size
@@ -235,16 +236,17 @@ class PTBModel(object):
       monte_carlo_results_mean,
       crossent
     )
-
-    bayesian_categorical_crossentropy = (
-            variance_loss + crossent + variance_depressor
-    )
+    bayesian_categorical_crossentropy = tf.add(variance_loss, crossent)
+    bayesian_categorical_crossentropy = tf.add(bayesian_categorical_crossentropy, variance_depressor)
     categorical_crossentropy_weight = 1.
     bayesian_categorical_crossentropy_weight = .2
+    crossent = tf.reshape(crossent, [self.batch_size, self.num_steps])
+    bayesian_categorical_crossentropy = tf.reshape(bayesian_categorical_crossentropy, [self.batch_size, self.num_steps])
     final_loss = tf.reduce_mean(
       categorical_crossentropy_weight * crossent +
       bayesian_categorical_crossentropy_weight * bayesian_categorical_crossentropy
     )
+    crossent = tf.reduce_mean(crossent, axis=[0])
 
     return crossent, final_loss
 
@@ -261,7 +263,7 @@ class PTBModel(object):
   def gaussian_categorical_crossentropy(self, true, pred, dist, undistorted_loss, num_classes):
     def map_fn(i):
       std_samples = tf.transpose(dist.sample(num_classes))
-      std_samples = tf.reshape(std_samples, [-1, 1, num_classes])
+      std_samples = tf.squeeze(std_samples)
       distorted_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
         labels=true,
         logits=pred + std_samples,
@@ -550,6 +552,27 @@ class LargeConfig(object):
   get_uncertainties = False
 
 
+class TiedNewLargeConfig(object):
+  """Large config."""
+  init_scale = 0.04
+  learning_rate = 1.0
+  max_grad_norm = 10
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 1500
+  embedding_size = 1500
+  max_epoch = 14
+  max_max_epoch = 55
+  keep_prob = 0.35
+  lr_decay = 1 / 1.15
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = True
+  use_projection = True
+  get_uncertainties = False
+
+
 class TestConfig(object):
   """Tiny config, for testing."""
   init_scale = 0.1
@@ -588,7 +611,7 @@ class NewTestConfig(object):
   rnn_mode = BLOCK
   tie_embeddings = False
   use_projection = False
-  get_uncertainties = False
+  get_uncertainties = True
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
@@ -645,7 +668,7 @@ def get_config():
   elif FLAGS.model == "nontied":
     config = NewMediumConfig
   elif FLAGS.model == "tiedl":
-    config = TiedNewMediumConfig()
+    config = TiedNewLargeConfig()
   else:
     raise ValueError("Invalid model: %s", FLAGS.model)
   if FLAGS.rnn_mode:
