@@ -193,7 +193,7 @@ class PTBModel(object):
     num_classes = tf.shape(logits)[2]
     logits_flat = tf.reshape(logits, [-1, num_classes])
     targets = tf.reshape(targets, [-1])
-    crossent = tf.sparse_softmax_cross_entropy_with_logits(
+    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
         labels=targets, logits=logits_flat)
     batch_size = tf.shape(logits)[0]
     sequence_length = tf.shape(logits)[1]
