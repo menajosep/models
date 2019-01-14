@@ -559,8 +559,8 @@ class TiedNewLargeConfig(object):
   max_grad_norm = 10
   num_layers = 2
   num_steps = 35
-  hidden_size = 1500
-  embedding_size = 1500
+  hidden_size = 600
+  embedding_size = 400
   max_epoch = 14
   max_max_epoch = 55
   keep_prob = 0.35
@@ -609,9 +609,9 @@ class NewTestConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = True
+  tie_embeddings = True
+  use_projection = True
+  get_uncertainties = False
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
