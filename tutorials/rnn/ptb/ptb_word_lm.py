@@ -136,19 +136,20 @@ class PTBModel(object):
     output, state = self._build_rnn_graph(inputs, config, is_training)
 
     if config.tie_embeddings:
+      softmax_w = tf.transpose(embedding)
+      proj = tf.get_variable("proj", [self.size, self.size])
+      proj_b = tf.get_variable("proj_b", [self.size])
+      output = tf.matmul(output, proj) + proj_b
       if config.use_projection:
         linear_w = tf.get_variable(
           "linear_w", [self.size, self.embedding_size], dtype=data_type())
         linear_b = tf.get_variable("linear_b", [self.embedding_size], dtype=data_type())
-        projected_output = tf.nn.xw_plus_b(output, linear_w, linear_b)
-        logits = tf.matmul(projected_output, tf.transpose(embedding))
-      else:
-        logits = tf.matmul(output, tf.transpose(embedding))
+        output = tf.nn.xw_plus_b(output, linear_w, linear_b)
     else:
       softmax_w = tf.get_variable(
           "softmax_w", [self.size, self.vocab_size], dtype=data_type())
-      softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
-      logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
+    softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
+    logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
     # Reshape logits to be a 3-D tensor for sequence loss
     logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
@@ -164,9 +165,11 @@ class PTBModel(object):
     else:
       loss = self.crossentropy_loss(logits, input_.targets)
       crossent = loss
-
     # Update the cost
     self._loss = tf.reduce_sum(loss)
+    if config.tie_embeddings:
+      l2loss = tf.nn.l2_loss(proj) / (self.batch_size * 6.5)
+      self._loss += l2loss
     self._cost = tf.reduce_sum(crossent)
     self._final_state = state
 
