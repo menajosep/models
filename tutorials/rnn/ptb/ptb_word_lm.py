@@ -517,6 +517,27 @@ class LargeConfig(object):
   get_uncertainties = False
 
 
+class BayesLargeConfig(object):
+  """Large config."""
+  init_scale = 0.04
+  learning_rate = 1.0
+  max_grad_norm = 10
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 1500
+  embedding_size = 1500
+  max_epoch = 14
+  max_max_epoch = 55
+  keep_prob = 0.35
+  lr_decay = 1 / 1.15
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = True
+
+
 class TiedLargeConfig(object):
   """Large config."""
   init_scale = 0.04
@@ -628,7 +649,7 @@ class NewTestConfig(object):
   max_grad_norm = 1
   num_layers = 1
   num_steps = 2
-  hidden_size = 4
+  hidden_size = 2
   embedding_size = 2
   max_epoch = 1
   max_max_epoch = 1
@@ -638,7 +659,7 @@ class NewTestConfig(object):
   vocab_size = 10000
   rnn_mode = BLOCK
   tie_embeddings = True
-  use_projection = True
+  use_projection = False
   get_uncertainties = False
 
 
@@ -695,6 +716,8 @@ def get_config():
     config = NewTestConfig()
   elif FLAGS.model == "baselinetied":
     config = TiedLargeConfig()
+  elif FLAGS.model == "baselinebayes":
+    config = BayesLargeConfig()
   elif FLAGS.model == "nontied":
     config = NewLargeConfig()
   elif FLAGS.model == "tied":
