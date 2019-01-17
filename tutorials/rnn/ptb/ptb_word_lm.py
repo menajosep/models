@@ -137,9 +137,9 @@ class PTBModel(object):
 
     if config.tie_embeddings:
       softmax_w = tf.transpose(embedding)
-      proj = tf.get_variable("proj", [self.size, self.size])
-      proj_b = tf.get_variable("proj_b", [self.size])
-      output = tf.matmul(output, proj) + proj_b
+      #proj = tf.get_variable("proj", [self.size, self.size])
+      #proj_b = tf.get_variable("proj_b", [self.size])
+      #output = tf.matmul(output, proj) + proj_b
       if config.use_projection:
         linear_w = tf.get_variable(
           "linear_w", [self.size, self.embedding_size], dtype=data_type())
@@ -167,9 +167,9 @@ class PTBModel(object):
       crossent = loss
     # Update the cost
     self._loss = tf.reduce_sum(loss)
-    if config.tie_embeddings:
-      l2loss = tf.nn.l2_loss(proj) / 6.5
-      self._loss += l2loss
+    #if config.tie_embeddings:
+    #  l2loss = tf.nn.l2_loss(proj) / 6.5
+    #  self._loss += l2loss
     if config.use_projection:
       l2linearloss = tf.nn.l2_loss(linear_w) / 6.5
       self._loss += l2linearloss
