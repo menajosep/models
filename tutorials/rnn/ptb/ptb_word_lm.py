@@ -475,7 +475,7 @@ class MediumConfig(object):
   get_uncertainties = False
 
 
-class MediumConfig(object):
+class BayesMediumConfig(object):
   """Medium config."""
   init_scale = 0.05
   learning_rate = 1.0
@@ -493,7 +493,7 @@ class MediumConfig(object):
   rnn_mode = BLOCK
   tie_embeddings = False
   use_projection = False
-  get_uncertainties = False
+  get_uncertainties = True
 
 
 class LargeConfig(object):
@@ -717,7 +717,7 @@ def get_config():
   elif FLAGS.model == "baselinetied":
     config = TiedLargeConfig()
   elif FLAGS.model == "baselinebayes":
-    config = BayesLargeConfig()
+    config = BayesMediumConfig
   elif FLAGS.model == "nontied":
     config = NewLargeConfig()
   elif FLAGS.model == "tied":
