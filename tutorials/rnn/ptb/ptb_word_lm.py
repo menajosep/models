@@ -170,9 +170,9 @@ class PTBModel(object):
     #if config.tie_embeddings:
     #  l2loss = tf.nn.l2_loss(proj) / 6.5
     #  self._loss += l2loss
-    if config.use_projection:
-      l2linearloss = tf.nn.l2_loss(linear_w) / 6.5
-      self._loss += l2linearloss
+    # if config.use_projection:
+    #   l2linearloss = tf.nn.l2_loss(linear_w) / 6.5
+    #   self._loss += l2linearloss
     self._cost = tf.reduce_sum(crossent)
     self._final_state = state
 
@@ -736,14 +736,6 @@ def get_config():
 def main(_):
   if not FLAGS.data_path:
     raise ValueError("Must set --data_path to PTB data directory")
-  gpus = [
-      x.name for x in device_lib.list_local_devices() if x.device_type == "GPU"
-  ]
-  if FLAGS.num_gpus > len(gpus):
-    raise ValueError(
-        "Your machine has only %d gpus "
-        "which is less than the requested --num_gpus=%d."
-        % (len(gpus), FLAGS.num_gpus))
 
   raw_data = reader.ptb_raw_data(FLAGS.data_path)
   train_data, valid_data, test_data, _ = raw_data
@@ -753,66 +745,56 @@ def main(_):
   eval_config.batch_size = 1
   eval_config.num_steps = 1
 
-  with tf.Graph().as_default():
-    initializer = tf.random_uniform_initializer(-config.init_scale,
-                                                config.init_scale)
+  #with tf.Graph().as_default():
+  initializer = tf.random_uniform_initializer(-config.init_scale,
+                                              config.init_scale)
 
-    with tf.name_scope("Train"):
-      train_input = PTBInput(config=config, data=train_data, name="TrainInput")
-      with tf.variable_scope("Model", reuse=None, initializer=initializer):
-        m = PTBModel(is_training=True, config=config, input_=train_input)
-      tf.summary.scalar("Training Loss", m.cost)
-      tf.summary.scalar("Learning Rate", m.lr)
+  with tf.name_scope("Train"):
+    train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+    with tf.variable_scope("Model", reuse=None, initializer=initializer):
+      m = PTBModel(is_training=True, config=config, input_=train_input)
+    tf.summary.scalar("Training Loss", m.cost)
+    tf.summary.scalar("Learning Rate", m.lr)
 
-    with tf.name_scope("Valid"):
-      valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
-      with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
-      tf.summary.scalar("Validation Loss", mvalid.cost)
+  with tf.name_scope("Valid"):
+    valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
+    with tf.variable_scope("Model", reuse=True, initializer=initializer):
+      mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
+    tf.summary.scalar("Validation Loss", mvalid.cost)
 
-    with tf.name_scope("Test"):
-      test_input = PTBInput(
-          config=eval_config, data=test_data, name="TestInput")
-      with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mtest = PTBModel(is_training=False, config=eval_config,
-                         input_=test_input)
+  with tf.name_scope("Test"):
+    test_input = PTBInput(
+        config=eval_config, data=test_data, name="TestInput")
+    with tf.variable_scope("Model", reuse=True, initializer=initializer):
+      mtest = PTBModel(is_training=False, config=eval_config,
+                       input_=test_input)
 
-    models = {"Train": m, "Valid": mvalid, "Test": mtest}
-    for name, model in models.items():
-      model.export_ops(name)
-    metagraph = tf.train.export_meta_graph()
-    if tf.__version__ < "1.1.0" and FLAGS.num_gpus > 1:
-      raise ValueError("num_gpus > 1 is not supported for TensorFlow versions "
-                       "below 1.1.0")
-    soft_placement = False
-    if FLAGS.num_gpus > 1:
-      soft_placement = True
-      util.auto_parallel(metagraph, m)
+  # saver
+  saver = tf.train.Saver()
+  with tf.Session() as session:
+    session.run(tf.global_variables_initializer())
+    for i in range(config.max_max_epoch):
+      lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+      m.assign_lr(session, config.learning_rate * lr_decay)
 
-  with tf.Graph().as_default():
-    tf.train.import_meta_graph(metagraph)
-    for model in models.values():
-      model.import_ops()
-    sv = tf.train.Supervisor(logdir=FLAGS.save_path)
-    config_proto = tf.ConfigProto(allow_soft_placement=soft_placement)
-    with sv.managed_session(config=config_proto) as session:
-      for i in range(config.max_max_epoch):
-        lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
-        m.assign_lr(session, config.learning_rate * lr_decay)
+      print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+      train_perplexity = run_epoch(session, m, eval_op=m.train_op,
+                                   verbose=True)
+      print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+      valid_perplexity = run_epoch(session, mvalid)
+      print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+    if FLAGS.save_path:
+      print("Saving model to %s." % FLAGS.save_path)
+      save_path = saver.save(session, FLAGS.save_path)
+      print("Saved model to %s." % save_path)
 
-        print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-        train_perplexity = run_epoch(session, m, eval_op=m.train_op,
-                                     verbose=True)
-        print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-        valid_perplexity = run_epoch(session, mvalid)
-        print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+      # value initial for checking restore
+      session.run(tf.global_variables_initializer())
+      save_path = saver.restore(session, FLAGS.save_path)
+    test_perplexity = run_epoch(session, mtest)
+    print("Test Perplexity: %.3f" % test_perplexity)
 
-      test_perplexity = run_epoch(session, mtest)
-      print("Test Perplexity: %.3f" % test_perplexity)
 
-      if FLAGS.save_path:
-        print("Saving model to %s." % FLAGS.save_path)
-        sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
 
 
 if __name__ == "__main__":
