@@ -208,7 +208,7 @@ class PTBModel(object):
     return crossent
 
   def crossentropy_loss_with_uncert(self, output, logits, targets):
-    T = 10
+    T = 50
     self.variance = tf.layers.dense(
       output,
       1,
@@ -658,9 +658,9 @@ class NewTestConfig(object):
   batch_size = 20
   vocab_size = 10000
   rnn_mode = BLOCK
-  tie_embeddings = True
+  tie_embeddings = False
   use_projection = False
-  get_uncertainties = False
+  get_uncertainties = True
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
