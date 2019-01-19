@@ -67,7 +67,6 @@ import tensorflow as tf
 import reader
 import util
 
-from tensorflow.python.client import device_lib
 from tensorflow.contrib import distributions
 
 flags = tf.flags
@@ -82,10 +81,6 @@ flags.DEFINE_string("save_path", None,
                     "Model output directory.")
 flags.DEFINE_bool("use_fp16", False,
                   "Train using 16-bit floats instead of 32bit floats")
-flags.DEFINE_integer("num_gpus", 1,
-                     "If larger than 1, Grappler AutoParallel optimizer "
-                     "will create multiple training replicas with each GPU "
-                     "running one replica.")
 flags.DEFINE_string("rnn_mode", None,
                     "The low level implementation of lstm cell: one of CUDNN, "
                     "BASIC, and BLOCK, representing cudnn_lstm, basic_lstm, "
@@ -394,7 +389,7 @@ class PTBModel(object):
             base_variable_scope="Model/RNN")
         tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, params_saveable)
     self._cost = tf.get_collection_ref(util.with_prefix(self._name, "cost"))[0]
-    num_replicas = FLAGS.num_gpus if self._name == "Train" else 1
+    num_replicas = 1
     self._initial_state = util.import_state_tuples(
         self._initial_state, self._initial_state_name, num_replicas)
     self._final_state = util.import_state_tuples(
@@ -452,6 +447,27 @@ class SmallConfig(object):
   tie_embeddings = False
   use_projection = False
   get_uncertainties = False
+
+
+class BayesSmallConfig(object):
+  """Small config."""
+  init_scale = 0.1
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 20
+  hidden_size = 200
+  embedding_size = 200
+  max_epoch = 4
+  max_max_epoch = 13
+  keep_prob = 1.0
+  lr_decay = 0.5
+  batch_size = 20
+  vocab_size = 10000
+  rnn_mode = BLOCK
+  tie_embeddings = False
+  use_projection = False
+  get_uncertainties = True
 
 
 class MediumConfig(object):
@@ -693,7 +709,7 @@ def run_epoch(session, model, eval_op=None, verbose=False):
     if verbose and step % (model.input.epoch_size // 10) == 10:
       print("%.3f perplexity: %.3f speed: %.0f wps" %
             (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
-             iters * model.input.batch_size * max(1, FLAGS.num_gpus) /
+             iters * model.input.batch_size /
              (time.time() - start_time)))
 
   return np.exp(costs / iters)
@@ -717,7 +733,7 @@ def get_config():
   elif FLAGS.model == "baselinetied":
     config = TiedLargeConfig()
   elif FLAGS.model == "baselinebayes":
-    config = BayesMediumConfig
+    config = BayesSmallConfig()
   elif FLAGS.model == "nontied":
     config = NewLargeConfig()
   elif FLAGS.model == "tied":
@@ -728,8 +744,6 @@ def get_config():
     raise ValueError("Invalid model: %s", FLAGS.model)
   if FLAGS.rnn_mode:
     config.rnn_mode = FLAGS.rnn_mode
-  if FLAGS.num_gpus != 1 or tf.__version__ < "1.3.0" :
-    config.rnn_mode = BASIC
   return config
 
 
