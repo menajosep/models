@@ -132,9 +132,6 @@ class PTBModel(object):
 
     if config.tie_embeddings:
       softmax_w = tf.transpose(embedding)
-      #proj = tf.get_variable("proj", [self.size, self.size])
-      #proj_b = tf.get_variable("proj_b", [self.size])
-      #output = tf.matmul(output, proj) + proj_b
       if config.use_projection:
         linear_w = tf.get_variable(
           "linear_w", [self.size, self.embedding_size], dtype=data_type())
@@ -148,13 +145,6 @@ class PTBModel(object):
     # Reshape logits to be a 3-D tensor for sequence loss
     logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
-    # Use the contrib sequence loss and average over the batches
-    # loss = tf.contrib.seq2seq.sequence_loss(
-    #     logits,
-    #     input_.targets,
-    #     tf.ones([self.batch_size, self.num_steps], dtype=data_type()),
-    #     average_across_timesteps=False,
-    #     average_across_batch=True)
     if config.get_uncertainties:
       crossent, loss = self.crossentropy_loss_with_uncert(output, logits, input_.targets)
     else:
@@ -162,12 +152,6 @@ class PTBModel(object):
       crossent = loss
     # Update the cost
     self._loss = tf.reduce_sum(loss)
-    #if config.tie_embeddings:
-    #  l2loss = tf.nn.l2_loss(proj) / 6.5
-    #  self._loss += l2loss
-    # if config.use_projection:
-    #   l2linearloss = tf.nn.l2_loss(linear_w) / 6.5
-    #   self._loss += l2linearloss
     self._cost = tf.reduce_sum(crossent)
     self._final_state = state
 
