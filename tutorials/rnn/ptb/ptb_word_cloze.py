@@ -61,6 +61,7 @@ from __future__ import print_function
 
 import time
 
+import dill
 import numpy as np
 import tensorflow as tf
 
@@ -77,6 +78,8 @@ flags.DEFINE_string("data_path", None,
                     "Where the training/test data is stored.")
 flags.DEFINE_string("save_path", None,
                     "Model output directory.")
+flags.DEFINE_string("embedding_path", None,
+                    "file with the learned embedddings.")
 flags.DEFINE_bool("use_fp16", False,
                   "Train using 16-bit floats instead of 32bit floats")
 flags.DEFINE_string("rnn_mode", None,
@@ -93,52 +96,39 @@ def data_type():
     return tf.float16 if FLAGS.use_fp16 else tf.float32
 
 
-class PTBInput(object):
-    """The input data."""
-
-    def __init__(self, config, data, name=None):
-        self.batch_size = batch_size = config.batch_size
-        self.num_steps = num_steps = config.num_steps
-        self.epoch_size = ((len(data) // batch_size) - 1) // num_steps
-        self.input_data, self.targets = reader_cloze.ptb_producer(
-            data, batch_size, num_steps, name=name)
-
-
 class PTBModel(object):
     """The PTB model."""
 
-    def __init__(self, is_training, config, input_):
+    def __init__(self, is_training, config, embeddings_matrix):
         self._is_training = is_training
-        self._input = input_
         self._rnn_params = None
         self._cell = None
-        self.batch_size = input_.batch_size
-        self.num_steps = input_.num_steps
+        self.batch_size = config.batch_size
+        self.num_steps = config.num_steps
         self.embedding_size = config.embedding_size
         self.size = config.hidden_size
         self.vocab_size = config.vocab_size
 
+        self._input_data = tf.placeholder(dtype=tf.int32, shape=[self.batch_size, self.num_steps])
+        self._targets = tf.placeholder(dtype=tf.int32, shape=[self.batch_size, 1])
+
         with tf.device("/cpu:0"):
             embedding = tf.get_variable(
-                "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
-            inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
+                "embedding", [self.vocab_size, self.embedding_size],
+                initializer=tf.constant_initializer(np.array(embeddings_matrix)), dtype=data_type())
+            inputs = tf.nn.embedding_lookup(embedding, self._input_data)
 
         if is_training and config.keep_prob < 1:
             inputs = tf.nn.dropout(inputs, config.keep_prob)
 
         output, state = self._build_rnn_graph(inputs, config, is_training)
 
-        if config.tie_embeddings:
-            softmax_w = tf.transpose(embedding)
-        else:
-            softmax_w = tf.get_variable(
-                "softmax_w", [self.size, self.vocab_size], dtype=data_type())
+        softmax_w = tf.get_variable(
+            "softmax_w", [self.size*self.num_steps, self.vocab_size], dtype=data_type())
         softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
         logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
-        # Reshape logits to be a 3-D tensor for sequence loss
-        logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
-        loss = self.crossentropy_loss(logits, input_.targets)
+        loss = self.crossentropy_loss(logits, self._targets)
         crossent = loss
         # Update the cost
         self._loss = tf.reduce_sum(loss)
@@ -162,14 +152,9 @@ class PTBModel(object):
         self._lr_update = tf.assign(self._lr, self._new_lr)
 
     def crossentropy_loss(self, logits, targets):
-        num_classes = tf.shape(logits)[2]
-        logits_flat = tf.reshape(logits, [-1, num_classes])
         targets = tf.reshape(targets, [-1])
         crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=targets, logits=logits_flat)
-        batch_size = tf.shape(logits)[0]
-        sequence_length = tf.shape(logits)[1]
-        crossent = tf.reshape(crossent, [batch_size, sequence_length])
+            labels=targets, logits=logits)
         crossent = tf.reduce_mean(crossent, axis=[0])
         return crossent
 
@@ -235,7 +220,8 @@ class PTBModel(object):
         outputs, state = tf.nn.static_rnn(cell, inputs,
                                           initial_state=self._initial_state)
         # reshape to (batch_size * num_steps, hidden_size)
-        output = tf.reshape(tf.concat(outputs, 1), [-1, config.hidden_size])
+        #output = tf.reshape(tf.concat(outputs, 1), [-1, config.hidden_size])
+        output = tf.concat(outputs, 1)
         return output, state
 
     def assign_lr(self, session, lr_value):
@@ -311,6 +297,14 @@ class PTBModel(object):
     def final_state_name(self):
         return self._final_state_name
 
+    @property
+    def input_data(self):
+        return self._input_data
+
+    @property
+    def targets(self):
+        return self._targets
+
 
 class SmallConfig(object):
     """Small config."""
@@ -318,6 +312,7 @@ class SmallConfig(object):
     learning_rate = 1.0
     max_grad_norm = 5
     num_layers = 2
+    min_sent_length = 10
     num_steps = 20
     hidden_size = 200
     embedding_size = 200
@@ -337,6 +332,7 @@ class MediumConfig(object):
     learning_rate = 1.0
     max_grad_norm = 5
     num_layers = 2
+    min_sent_length = 10
     num_steps = 35
     hidden_size = 650
     embedding_size = 650
@@ -356,6 +352,7 @@ class LargeConfig(object):
     learning_rate = 1.0
     max_grad_norm = 10
     num_layers = 2
+    min_sent_length = 10
     num_steps = 35
     hidden_size = 1500
     embedding_size = 1500
@@ -375,6 +372,7 @@ class TestConfig(object):
     learning_rate = 1.0
     max_grad_norm = 1
     num_layers = 1
+    min_sent_length = 1
     num_steps = 2
     hidden_size = 2
     embedding_size = 2
@@ -394,11 +392,12 @@ class NewTestConfig(object):
     learning_rate = 1.0
     max_grad_norm = 1
     num_layers = 1
-    num_steps = 2
+    min_sent_length = 1
+    num_steps = 10
     hidden_size = 2
     embedding_size = 2
     max_epoch = 1
-    max_max_epoch = 1
+    max_max_epoch = 2
     keep_prob = 1.0
     lr_decay = 0.5
     batch_size = 20
@@ -407,11 +406,14 @@ class NewTestConfig(object):
     tie_embeddings = False
 
 
-def run_epoch(session, model, eval_op=None, verbose=False):
+def run_epoch(session, model, data, word_to_id, eval_op=None, verbose=False):
     """Runs the model on the given data."""
     start_time = time.time()
     costs = 0.0
     iters = 0
+    n_batches = len(data) // model.batch_size
+    input_data, targets = reader_cloze.ptb_producer(
+        data, model.batch_size, model.num_steps, word_to_id)
     state = session.run(model.initial_state)
 
     fetches = {
@@ -421,8 +423,8 @@ def run_epoch(session, model, eval_op=None, verbose=False):
     if eval_op is not None:
         fetches["eval_op"] = eval_op
 
-    for step in range(model.input.epoch_size):
-        feed_dict = {}
+    for step in range(n_batches):
+        feed_dict = {model.input_data: input_data[step], model.targets: targets[step]}
         for i, (c, h) in enumerate(model.initial_state):
             feed_dict[c] = state[i].c
             feed_dict[h] = state[i].h
@@ -432,12 +434,12 @@ def run_epoch(session, model, eval_op=None, verbose=False):
         state = vals["final_state"]
 
         costs += cost
-        iters += model.input.num_steps
+        iters += 1
 
-        if verbose and step % (model.input.epoch_size // 10) == 10:
+        if verbose and step % (n_batches // 10) == 10:
             print("%.3f perplexity: %.3f speed: %.0f wps" %
-                  (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
-                   iters * model.input.batch_size /
+                  (step * 1.0 / n_batches, np.exp(costs / iters),
+                   iters * model.batch_size /
                    (time.time() - start_time)))
 
     return np.exp(costs / iters)
@@ -468,38 +470,43 @@ def get_config():
 def main(_):
     if not FLAGS.data_path:
         raise ValueError("Must set --data_path to PTB data directory")
-
-    raw_data = reader_cloze.ptb_raw_data(FLAGS.data_path)
-    train_data, valid_data, test_data, _ = raw_data
+    if not FLAGS.embedding_path:
+        raise ValueError("Must set --embedding_path to embeddings file")
 
     config = get_config()
+    config.vocab_size += 1
     eval_config = get_config()
     eval_config.batch_size = 1
-    eval_config.num_steps = 1
+    eval_config.vocab_size += 1
+
+    raw_data = reader_cloze.ptb_raw_data(FLAGS.data_path,
+                                         config.min_sent_length,
+                                         config.num_steps)
+    train_data, valid_data, test_data, _, word_to_id = raw_data
+
+    with open(FLAGS.embedding_path, 'rb') as input_file:
+        embeddings = dill.load(input_file)
+        avg = np.mean(embeddings, axis=0)
+        embeddings = np.append(embeddings, [avg], axis=0)
 
     with tf.Graph().as_default():
         initializer = tf.random_uniform_initializer(-config.init_scale,
                                                     config.init_scale)
 
         with tf.name_scope("Train"):
-            train_input = PTBInput(config=config, data=train_data, name="TrainInput")
             with tf.variable_scope("Model", reuse=None, initializer=initializer):
-                m = PTBModel(is_training=True, config=config, input_=train_input)
+                m = PTBModel(is_training=True, config=config, embeddings_matrix=embeddings)
             tf.summary.scalar("Training Loss", m.cost)
             tf.summary.scalar("Learning Rate", m.lr)
 
         with tf.name_scope("Valid"):
-            valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
             with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
+                mvalid = PTBModel(is_training=False, config=config, embeddings_matrix=embeddings)
             tf.summary.scalar("Validation Loss", mvalid.cost)
 
         with tf.name_scope("Test"):
-            test_input = PTBInput(
-                config=eval_config, data=test_data, name="TestInput")
             with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mtest = PTBModel(is_training=False, config=eval_config,
-                                 input_=test_input)
+                mtest = PTBModel(is_training=False, config=eval_config, embeddings_matrix=embeddings)
 
         soft_placement = False
         sv = tf.train.Supervisor(logdir=FLAGS.save_path)
@@ -510,13 +517,13 @@ def main(_):
                 m.assign_lr(session, config.learning_rate * lr_decay)
 
                 print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-                train_perplexity = run_epoch(session, m, eval_op=m.train_op,
+                train_perplexity = run_epoch(session, m, train_data, word_to_id, eval_op=m.train_op,
                                              verbose=True)
                 print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-                valid_perplexity = run_epoch(session, mvalid)
+                valid_perplexity = run_epoch(session, mvalid, valid_data, word_to_id)
                 print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
 
-            test_perplexity = run_epoch(session, mtest)
+            test_perplexity = run_epoch(session, mtest, test_data, word_to_id)
             print("Test Perplexity: %.3f" % test_perplexity)
 
             if FLAGS.save_path:
