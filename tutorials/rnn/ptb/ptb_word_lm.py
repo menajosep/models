@@ -59,8 +59,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import time
 
+import dill
 import numpy as np
 import tensorflow as tf
 
@@ -79,6 +81,10 @@ flags.DEFINE_string("data_path", None,
                     "Where the training/test data is stored.")
 flags.DEFINE_string("save_path", None,
                     "Model output directory.")
+flags.DEFINE_bool("is_training", True,
+                  "tells if the model must be trained or restore")
+flags.DEFINE_string("restore_path", None,
+                    "Model input directory.")
 flags.DEFINE_bool("use_fp16", False,
                   "Train using 16-bit floats instead of 32bit floats")
 flags.DEFINE_string("rnn_mode", None,
@@ -121,9 +127,9 @@ class PTBModel(object):
     self.vocab_size = config.vocab_size
 
     with tf.device("/cpu:0"):
-      embedding = tf.get_variable(
+      self._embedding = tf.get_variable(
           "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
-      inputs = tf.nn.embedding_lookup(embedding, input_.input_data)
+      inputs = tf.nn.embedding_lookup(self._embedding, input_.input_data)
 
     if is_training and config.keep_prob < 1:
       inputs = tf.nn.dropout(inputs, config.keep_prob)
@@ -131,7 +137,7 @@ class PTBModel(object):
     output, state = self._build_rnn_graph(inputs, config, is_training)
 
     if config.tie_embeddings:
-      softmax_w = tf.transpose(embedding)
+      softmax_w = tf.transpose(self._embedding)
       if config.use_projection:
         linear_w = tf.get_variable(
           "linear_w", [self.size, self.embedding_size], dtype=data_type())
@@ -411,6 +417,10 @@ class PTBModel(object):
   def final_state_name(self):
     return self._final_state_name
 
+  @property
+  def embedding(self):
+    return self._embedding
+
 
 class SmallConfig(object):
   """Small config."""
@@ -660,7 +670,7 @@ class NewTestConfig(object):
   rnn_mode = BLOCK
   tie_embeddings = False
   use_projection = False
-  get_uncertainties = True
+  get_uncertainties = False
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
@@ -673,6 +683,7 @@ def run_epoch(session, model, eval_op=None, verbose=False):
   fetches = {
       "cost": model.cost,
       "final_state": model.final_state,
+      "embedding": model.embedding
   }
   if eval_op is not None:
     fetches["eval_op"] = eval_op
@@ -686,6 +697,7 @@ def run_epoch(session, model, eval_op=None, verbose=False):
     vals = session.run(fetches, feed_dict)
     cost = vals["cost"]
     state = vals["final_state"]
+    embedding = vals["embedding"]
 
     costs += cost
     iters += model.input.num_steps
@@ -696,7 +708,7 @@ def run_epoch(session, model, eval_op=None, verbose=False):
              iters * model.input.batch_size /
              (time.time() - start_time)))
 
-  return np.exp(costs / iters)
+  return np.exp(costs / iters), embedding
 
 
 def get_config():
@@ -739,9 +751,11 @@ def main(_):
   train_data, valid_data, test_data, _ = raw_data
 
   config = get_config()
+  config.vocab_size += 1
   eval_config = get_config()
   eval_config.batch_size = 1
   eval_config.num_steps = 1
+  eval_config.vocab_size += 1
 
   with tf.Graph().as_default():
     initializer = tf.random_uniform_initializer(-config.init_scale,
@@ -771,24 +785,32 @@ def main(_):
     sv = tf.train.Supervisor(logdir=FLAGS.save_path)
     config_proto = tf.ConfigProto(allow_soft_placement=soft_placement)
     with sv.managed_session(config=config_proto) as session:
-      for i in range(config.max_max_epoch):
-        lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
-        m.assign_lr(session, config.learning_rate * lr_decay)
+      if FLAGS.is_training:
+        for i in range(config.max_max_epoch):
+          lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+          m.assign_lr(session, config.learning_rate * lr_decay)
 
-        print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-        train_perplexity = run_epoch(session, m, eval_op=m.train_op,
-                                     verbose=True)
-        print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-        valid_perplexity = run_epoch(session, mvalid)
-        print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+          print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+          train_perplexity, _ = run_epoch(session, m, eval_op=m.train_op,
+                                       verbose=True)
+          print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+          valid_perplexity, _ = run_epoch(session, mvalid)
+          print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+      else:
+        sv.saver.restore(session, FLAGS.restore_path)
 
-      test_perplexity = run_epoch(session, mtest)
+
+      test_perplexity, embedding = run_epoch(session, mtest)
       print("Test Perplexity: %.3f" % test_perplexity)
 
       if FLAGS.save_path:
         print("Saving model to %s." % FLAGS.save_path)
         save_path = sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
         print("Saved model to %s." % save_path)
+        print("Saving embeddings to %s." % FLAGS.save_path)
+        with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
+          dill.dump(embedding, outputfile)
+        print("Saved embeddings to %s." % save_path)
 
 
 if __name__ == "__main__":
