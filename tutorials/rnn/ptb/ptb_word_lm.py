@@ -751,11 +751,9 @@ def main(_):
   train_data, valid_data, test_data, _ = raw_data
 
   config = get_config()
-  config.vocab_size += 1
   eval_config = get_config()
   eval_config.batch_size = 1
   eval_config.num_steps = 1
-  eval_config.vocab_size += 1
 
   with tf.Graph().as_default():
     initializer = tf.random_uniform_initializer(-config.init_scale,
