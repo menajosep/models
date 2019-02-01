@@ -115,16 +115,27 @@ class PTBModel(object):
         with tf.device("/cpu:0"):
             embedding = tf.get_variable(
                 "embedding", [self.vocab_size, self.embedding_size],
-                initializer=tf.constant_initializer(np.array(embeddings_matrix)), dtype=data_type())
+                initializer=tf.constant_initializer(np.array(embeddings_matrix)),
+                dtype=data_type(),
+                trainable=False
+            )
             inputs = tf.nn.embedding_lookup(embedding, self._input_data)
 
         if is_training and config.keep_prob < 1:
             inputs = tf.nn.dropout(inputs, config.keep_prob)
 
-        output, state = self._build_rnn_graph(inputs, config, is_training)
+        encoder_output, state = self._build_rnn_graph_lstm(inputs, config, is_training)
 
-        softmax_w = tf.get_variable(
-            "softmax_w", [self.size*self.num_steps, self.vocab_size], dtype=data_type())
+        pool_w = tf.get_variable(
+            "pool_w", [self.size * self.num_steps, self.embedding_size], dtype=data_type())
+        pool_b = tf.get_variable("pool_b", [self.embedding_size], dtype=data_type())
+        output = tf.nn.xw_plus_b(encoder_output, pool_w, pool_b)
+
+        if config.tie_embeddings:
+            softmax_w = tf.transpose(embedding)
+        else:
+            softmax_w = tf.get_variable(
+                "softmax_w", [self.embedding_size, self.vocab_size], dtype=data_type())
         softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
         logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
 
@@ -157,36 +168,6 @@ class PTBModel(object):
             labels=targets, logits=logits)
         crossent = tf.reduce_mean(crossent, axis=[0])
         return crossent
-
-    def _build_rnn_graph(self, inputs, config, is_training):
-        if config.rnn_mode == CUDNN:
-            return self._build_rnn_graph_cudnn(inputs, config, is_training)
-        else:
-            return self._build_rnn_graph_lstm(inputs, config, is_training)
-
-    def _build_rnn_graph_cudnn(self, inputs, config, is_training):
-        """Build the inference graph using CUDNN cell."""
-        inputs = tf.transpose(inputs, [1, 0, 2])
-        self._cell = tf.contrib.cudnn_rnn.CudnnLSTM(
-            num_layers=config.num_layers,
-            num_units=config.hidden_size,
-            input_size=config.hidden_size,
-            dropout=1 - config.keep_prob if is_training else 0)
-        params_size_t = self._cell.params_size()
-        self._rnn_params = tf.get_variable(
-            "lstm_params",
-            initializer=tf.random_uniform(
-                [params_size_t], -config.init_scale, config.init_scale),
-            validate_shape=False)
-        c = tf.zeros([config.num_layers, self.batch_size, config.hidden_size],
-                     tf.float32)
-        h = tf.zeros([config.num_layers, self.batch_size, config.hidden_size],
-                     tf.float32)
-        self._initial_state = (tf.contrib.rnn.LSTMStateTuple(h=h, c=c),)
-        outputs, h, c = self._cell(inputs, h, c, self._rnn_params, is_training)
-        outputs = tf.transpose(outputs, [1, 0, 2])
-        outputs = tf.reshape(outputs, [-1, config.hidden_size])
-        return outputs, (tf.contrib.rnn.LSTMStateTuple(h=h, c=c),)
 
     def _get_lstm_cell(self, config, is_training):
         if config.rnn_mode == BASIC:
@@ -264,10 +245,6 @@ class PTBModel(object):
             self._initial_state, self._initial_state_name, num_replicas)
         self._final_state = util.import_state_tuples(
             self._final_state, self._final_state_name, num_replicas)
-
-    @property
-    def input(self):
-        return self._input
 
     @property
     def initial_state(self):
