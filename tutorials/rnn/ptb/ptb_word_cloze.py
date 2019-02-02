@@ -110,7 +110,7 @@ class PTBModel(object):
         self.vocab_size = config.vocab_size
 
         self._input_data = tf.placeholder(dtype=tf.int32, shape=[self.batch_size, self.num_steps])
-        self._targets = tf.placeholder(dtype=tf.int32, shape=[self.batch_size, 1])
+        self._targets = tf.placeholder(dtype=tf.int32, shape=[self.batch_size])
 
         with tf.device("/cpu:0"):
             embedding = tf.get_variable(
@@ -126,10 +126,16 @@ class PTBModel(object):
 
         encoder_output, state = self._build_rnn_graph_lstm(inputs, config, is_training)
 
+        if is_training and config.keep_prob < 1:
+            encoder_output = tf.nn.dropout(encoder_output, config.keep_prob)
+
         pool_w = tf.get_variable(
             "pool_w", [self.size * self.num_steps, self.embedding_size], dtype=data_type())
         pool_b = tf.get_variable("pool_b", [self.embedding_size], dtype=data_type())
         output = tf.nn.xw_plus_b(encoder_output, pool_w, pool_b)
+
+        if is_training and config.keep_prob < 1:
+            output = tf.nn.dropout(output, config.keep_prob)
 
         if config.tie_embeddings:
             softmax_w = tf.transpose(embedding)
@@ -418,7 +424,8 @@ def run_epoch(session, model, data, word_to_id, eval_op=None, verbose=False):
                   (step * 1.0 / n_batches, np.exp(costs / iters),
                    iters * model.batch_size /
                    (time.time() - start_time)))
-
+    if FLAGS.save_path:
+        tf.train.Saver().save(session, FLAGS.save_path)
     return np.exp(costs / iters)
 
 
@@ -466,7 +473,7 @@ def main(_):
         avg = np.mean(embeddings, axis=0)
         embeddings = np.append(embeddings, [avg], axis=0)
 
-    with tf.Graph().as_default():
+    with tf.Graph().as_default() as graph:
         initializer = tf.random_uniform_initializer(-config.init_scale,
                                                     config.init_scale)
 
@@ -485,10 +492,8 @@ def main(_):
             with tf.variable_scope("Model", reuse=True, initializer=initializer):
                 mtest = PTBModel(is_training=False, config=eval_config, embeddings_matrix=embeddings)
 
-        soft_placement = False
-        sv = tf.train.Supervisor(logdir=FLAGS.save_path)
-        config_proto = tf.ConfigProto(allow_soft_placement=soft_placement)
-        with sv.managed_session(config=config_proto) as session:
+        with tf.Session(graph=graph) as session:
+            session.run(tf.global_variables_initializer())
             for i in range(config.max_max_epoch):
                 lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
                 m.assign_lr(session, config.learning_rate * lr_decay)
@@ -505,8 +510,7 @@ def main(_):
 
             if FLAGS.save_path:
                 print("Saving model to %s." % FLAGS.save_path)
-                save_path = sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
-                print("Saved model to %s." % save_path)
+                save_path = tf.train.Saver().save(session, FLAGS.save_path)
 
 
 if __name__ == "__main__":

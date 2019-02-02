@@ -137,5 +137,5 @@ def ptb_producer(raw_data, batch_size, num_steps, word_to_id):
     x = np.reshape(x, [n_batches, batch_size, num_steps])
     y = np.array(y)
     y = y[:n_batches * batch_size]
-    y = np.reshape(y, [n_batches, batch_size, 1])
+    y = np.reshape(y, [n_batches, batch_size])
     return x, y
