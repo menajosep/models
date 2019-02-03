@@ -66,7 +66,6 @@ import numpy as np
 import tensorflow as tf
 
 import reader_cloze
-import util
 
 flags = tf.flags
 logging = tf.logging
@@ -203,54 +202,15 @@ class PTBModel(object):
 
         self._initial_state = cell.zero_state(config.batch_size, data_type())
         inputs = tf.unstack(inputs, num=self.num_steps, axis=1)
-        # sze of outputs  (batch_size, num_steps, hidden_size)
+        # size of outputs  (batch_size, num_steps, hidden_size)
         outputs, state = tf.nn.static_rnn(cell, inputs,
                                           initial_state=self._initial_state)
-        # reshape to (batch_size * num_steps, hidden_size)
-        #output = tf.reshape(tf.concat(outputs, 1), [-1, config.hidden_size])
+        # size of outputs  (batch_size, num_steps*hidden_size)
         output = tf.concat(outputs, 1)
         return output, state
 
     def assign_lr(self, session, lr_value):
         session.run(self._lr_update, feed_dict={self._new_lr: lr_value})
-
-    def export_ops(self, name):
-        """Exports ops to collections."""
-        self._name = name
-        ops = {util.with_prefix(self._name, "cost"): self._cost}
-        if self._is_training:
-            ops.update(lr=self._lr, new_lr=self._new_lr, lr_update=self._lr_update)
-            if self._rnn_params:
-                ops.update(rnn_params=self._rnn_params)
-        for name, op in ops.items():
-            tf.add_to_collection(name, op)
-        self._initial_state_name = util.with_prefix(self._name, "initial")
-        self._final_state_name = util.with_prefix(self._name, "final")
-        util.export_state_tuples(self._initial_state, self._initial_state_name)
-        util.export_state_tuples(self._final_state, self._final_state_name)
-
-    def import_ops(self):
-        """Imports ops from collections."""
-        if self._is_training:
-            self._train_op = tf.get_collection_ref("train_op")[0]
-            self._lr = tf.get_collection_ref("lr")[0]
-            self._new_lr = tf.get_collection_ref("new_lr")[0]
-            self._lr_update = tf.get_collection_ref("lr_update")[0]
-            rnn_params = tf.get_collection_ref("rnn_params")
-            if self._cell and rnn_params:
-                params_saveable = tf.contrib.cudnn_rnn.RNNParamsSaveable(
-                    self._cell,
-                    self._cell.params_to_canonical,
-                    self._cell.canonical_to_params,
-                    rnn_params,
-                    base_variable_scope="Model/RNN")
-                tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, params_saveable)
-        self._cost = tf.get_collection_ref(util.with_prefix(self._name, "cost"))[0]
-        num_replicas = 1
-        self._initial_state = util.import_state_tuples(
-            self._initial_state, self._initial_state_name, num_replicas)
-        self._final_state = util.import_state_tuples(
-            self._final_state, self._final_state_name, num_replicas)
 
     @property
     def initial_state(self):
@@ -271,14 +231,6 @@ class PTBModel(object):
     @property
     def train_op(self):
         return self._train_op
-
-    @property
-    def initial_state_name(self):
-        return self._initial_state_name
-
-    @property
-    def final_state_name(self):
-        return self._final_state_name
 
     @property
     def input_data(self):
@@ -316,7 +268,7 @@ class MediumConfig(object):
     max_grad_norm = 5
     num_layers = 2
     min_sent_length = 10
-    num_steps = 35
+    num_steps = 40
     hidden_size = 650
     embedding_size = 650
     max_epoch = 6
@@ -336,7 +288,7 @@ class LargeConfig(object):
     max_grad_norm = 10
     num_layers = 2
     min_sent_length = 10
-    num_steps = 35
+    num_steps = 40
     hidden_size = 1500
     embedding_size = 1500
     max_epoch = 14
@@ -389,7 +341,7 @@ class NewTestConfig(object):
     tie_embeddings = False
 
 
-def run_epoch(session, model, data, word_to_id, eval_op=None, verbose=False):
+def run_epoch(session, model, data, word_to_id, epoch_number, eval_op=None, verbose=False):
     """Runs the model on the given data."""
     start_time = time.time()
     costs = 0.0
@@ -401,7 +353,7 @@ def run_epoch(session, model, data, word_to_id, eval_op=None, verbose=False):
 
     fetches = {
         "cost": model.cost,
-        "final_state": model.final_state,
+        "final_state": model.final_state
     }
     if eval_op is not None:
         fetches["eval_op"] = eval_op
@@ -425,13 +377,12 @@ def run_epoch(session, model, data, word_to_id, eval_op=None, verbose=False):
                    iters * model.batch_size /
                    (time.time() - start_time)))
     if FLAGS.save_path:
-        tf.train.Saver().save(session, FLAGS.save_path)
+        tf.train.Saver().save(session, FLAGS.save_path, global_step=epoch_number*n_batches)
     return np.exp(costs / iters)
 
 
 def get_config():
     """Get model config."""
-    config = None
     if FLAGS.model == "small":
         config = SmallConfig()
     elif FLAGS.model == "medium":
@@ -495,22 +446,19 @@ def main(_):
         with tf.Session(graph=graph) as session:
             session.run(tf.global_variables_initializer())
             for i in range(config.max_max_epoch):
-                lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+                epoch_number = i + 1
+                lr_decay = config.lr_decay ** max(epoch_number - config.max_epoch, 0)
                 m.assign_lr(session, config.learning_rate * lr_decay)
 
-                print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-                train_perplexity = run_epoch(session, m, train_data, word_to_id, eval_op=m.train_op,
+                print("Epoch: %d Learning rate: %.3f" % (epoch_number, session.run(m.lr)))
+                train_perplexity = run_epoch(session, m, train_data, word_to_id, epoch_number, eval_op=m.train_op,
                                              verbose=True)
-                print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-                valid_perplexity = run_epoch(session, mvalid, valid_data, word_to_id)
-                print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+                print("Epoch: %d Train Perplexity: %.3f" % (epoch_number, train_perplexity))
+                valid_perplexity = run_epoch(session, mvalid, valid_data, word_to_id, epoch_number)
+                print("Epoch: %d Valid Perplexity: %.3f" % (epoch_number, valid_perplexity))
 
-            test_perplexity = run_epoch(session, mtest, test_data, word_to_id)
+            test_perplexity = run_epoch(session, mtest, test_data, word_to_id, epoch_number)
             print("Test Perplexity: %.3f" % test_perplexity)
-
-            if FLAGS.save_path:
-                print("Saving model to %s." % FLAGS.save_path)
-                save_path = tf.train.Saver().save(session, FLAGS.save_path)
 
 
 if __name__ == "__main__":
