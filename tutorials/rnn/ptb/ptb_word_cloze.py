@@ -301,6 +301,26 @@ class LargeConfig(object):
     tie_embeddings = False
 
 
+class TiedConfig(object):
+    """Large config."""
+    init_scale = 0.04
+    learning_rate = 1.0
+    max_grad_norm = 10
+    num_layers = 2
+    min_sent_length = 10
+    num_steps = 40
+    hidden_size = 600
+    embedding_size = 600
+    max_epoch = 14
+    max_max_epoch = 55
+    keep_prob = 0.35
+    lr_decay = 1 / 1.15
+    batch_size = 20
+    vocab_size = 10000
+    rnn_mode = BLOCK
+    tie_embeddings = True
+
+
 class TestConfig(object):
     """Tiny config, for testing."""
     init_scale = 0.1
@@ -313,26 +333,6 @@ class TestConfig(object):
     embedding_size = 2
     max_epoch = 1
     max_max_epoch = 1
-    keep_prob = 1.0
-    lr_decay = 0.5
-    batch_size = 20
-    vocab_size = 10000
-    rnn_mode = BLOCK
-    tie_embeddings = False
-
-
-class NewTestConfig(object):
-    """Tiny config, for testing."""
-    init_scale = 0.1
-    learning_rate = 1.0
-    max_grad_norm = 1
-    num_layers = 1
-    min_sent_length = 1
-    num_steps = 10
-    hidden_size = 2
-    embedding_size = 2
-    max_epoch = 1
-    max_max_epoch = 2
     keep_prob = 1.0
     lr_decay = 0.5
     batch_size = 20
@@ -393,8 +393,8 @@ def get_config():
         config = LargeConfig()
     elif FLAGS.model == "test":
         config = TestConfig()
-    elif FLAGS.model == "newtest":
-        config = NewTestConfig()
+    elif FLAGS.model == "tied":
+        config = TiedConfig()
     else:
         raise ValueError("Invalid model: %s", FLAGS.model)
     if FLAGS.rnn_mode:
