@@ -151,8 +151,17 @@ class PTBModel(object):
     # Reshape logits to be a 3-D tensor for sequence loss
     logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
+    sigma_w = tf.get_variable(
+      "sigma_w", [self.size, self.vocab_size], dtype=data_type())
+    sigma_b = tf.get_variable("sigma_b", [self.vocab_size], dtype=data_type())
+    logits_sigma = tf.nn.xw_plus_b(output, sigma_w, sigma_b)
+
+    # Reshape logits to be a 3-D tensor for sequence loss
+    logits_sigma = tf.reshape(logits_sigma, [self.batch_size, self.num_steps, self.vocab_size])
+
     if config.get_uncertainties:
-      crossent, loss = self.crossentropy_loss_with_uncert(output, logits, input_.targets)
+      one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
+      crossent, loss = self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels)
     else:
       loss = self.crossentropy_loss(logits, input_.targets)
       crossent = loss
@@ -192,7 +201,26 @@ class PTBModel(object):
     crossent = tf.reduce_mean(crossent, axis=[0])
     return crossent
 
-  def crossentropy_loss_with_uncert(self, output, logits, targets):
+
+  def crossentropy_loss_with_uncert(self, logits_mu, logits_sigma, y_true):
+    num_samples = 100
+    epsilon = 1e-7
+    noise = tf.random_normal((lambda shape: (shape[0], num_samples * shape[1], shape[2]))(tf.shape(logits_sigma)))
+    z = tf.tile(logits_mu, [1, num_samples, 1]) + noise * tf.tile(logits_sigma, [1, num_samples, 1])
+    sample_probs = tf.nn.softmax(z, axis=-1)
+    sample_probs = tf.reduce_mean(
+      tf.reshape(sample_probs, (lambda shape: (shape[0], num_samples, -1, shape[2]))(tf.shape(logits_sigma))),
+      axis=1
+    )
+    sample_log_probs = -tf.reduce_sum(y_true * tf.log(sample_probs + epsilon), axis=-1)
+    sample_xentropy = tf.reduce_mean(sample_log_probs)
+
+    probs = tf.nn.softmax(logits_mu, axis=-1)
+    log_probs = -tf.reduce_sum(y_true * tf.log(probs + epsilon), axis=-1)
+    xentropy = tf.reduce_mean(log_probs)
+    return xentropy, sample_xentropy
+
+  def crossentropy_loss_with_uncert2(self, output, logits, targets):
     T = 50
     self.variance = tf.layers.dense(
       output,
@@ -670,7 +698,7 @@ class NewTestConfig(object):
   rnn_mode = BLOCK
   tie_embeddings = False
   use_projection = False
-  get_uncertainties = False
+  get_uncertainties = True
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
