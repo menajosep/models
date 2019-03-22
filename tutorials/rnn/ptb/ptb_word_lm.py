@@ -757,7 +757,7 @@ def get_config():
   elif FLAGS.model == "baselinetied":
     config = TiedLargeConfig()
   elif FLAGS.model == "baselinebayes":
-    config = BayesSmallConfig()
+    config = BayesMediumConfig()
   elif FLAGS.model == "nontied":
     config = NewLargeConfig()
   elif FLAGS.model == "tied":
