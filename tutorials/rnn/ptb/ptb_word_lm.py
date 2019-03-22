@@ -135,6 +135,7 @@ class PTBModel(object):
       inputs = tf.nn.dropout(inputs, config.keep_prob)
 
     output, state = self._build_rnn_graph(inputs, config, is_training)
+    self._output_layer = output
 
     if config.tie_embeddings:
       softmax_w = tf.transpose(self._embedding)
@@ -150,17 +151,21 @@ class PTBModel(object):
     logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
     # Reshape logits to be a 3-D tensor for sequence loss
     logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
+    self._logits = logits
 
     sigma_w = tf.get_variable(
       "sigma_w", [self.size, self.vocab_size], dtype=data_type())
     sigma_b = tf.get_variable("sigma_b", [self.vocab_size], dtype=data_type())
     logits_sigma = tf.nn.xw_plus_b(output, sigma_w, sigma_b)
 
+
     # Reshape logits to be a 3-D tensor for sequence loss
     logits_sigma = tf.reshape(logits_sigma, [self.batch_size, self.num_steps, self.vocab_size])
+    self._logits_sigma = logits_sigma
 
+    one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
+    self._one_hot_labels = one_hot_labels
     if config.get_uncertainties:
-      one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
       crossent, loss = self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels)
     else:
       loss = self.crossentropy_loss(logits, input_.targets)
@@ -449,6 +454,22 @@ class PTBModel(object):
   def embedding(self):
     return self._embedding
 
+  @property
+  def logits_sigma(self):
+    return self._logits_sigma
+
+  @property
+  def logits(self):
+    return self._logits
+
+  @property
+  def one_hot_labels(self):
+    return self._one_hot_labels
+
+  @property
+  def output_layer(self):
+    return self._output_layer
+
 
 class SmallConfig(object):
   """Small config."""
@@ -687,18 +708,18 @@ class NewTestConfig(object):
   max_grad_norm = 1
   num_layers = 1
   num_steps = 2
-  hidden_size = 2
-  embedding_size = 2
+  hidden_size = 4
+  embedding_size = 4
   max_epoch = 1
   max_max_epoch = 1
   keep_prob = 1.0
   lr_decay = 0.5
-  batch_size = 20
+  batch_size = 10
   vocab_size = 10000
   rnn_mode = BLOCK
   tie_embeddings = False
   use_projection = False
-  get_uncertainties = True
+  get_uncertainties = False
 
 
 def run_epoch(session, model, eval_op=None, verbose=False):
@@ -711,7 +732,10 @@ def run_epoch(session, model, eval_op=None, verbose=False):
   fetches = {
       "cost": model.cost,
       "final_state": model.final_state,
-      "embedding": model.embedding
+      "embedding": model.embedding,
+      "logits": model.logits,
+      "one_hot_labels": model.one_hot_labels,
+      "output_layer": model.output_layer
   }
   if eval_op is not None:
     fetches["eval_op"] = eval_op
@@ -726,6 +750,9 @@ def run_epoch(session, model, eval_op=None, verbose=False):
     cost = vals["cost"]
     state = vals["final_state"]
     embedding = vals["embedding"]
+    logits = vals["logits"]
+    one_hot_labels = vals["one_hot_labels"]
+    output_layer = vals["output_layer"]
 
     costs += cost
     iters += model.input.num_steps
@@ -736,7 +763,7 @@ def run_epoch(session, model, eval_op=None, verbose=False):
              iters * model.input.batch_size /
              (time.time() - start_time)))
 
-  return np.exp(costs / iters), embedding
+  return np.exp(costs / iters), embedding, logits, one_hot_labels, output_layer
 
 
 def get_config():
@@ -817,16 +844,15 @@ def main(_):
           m.assign_lr(session, config.learning_rate * lr_decay)
 
           print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-          train_perplexity, _ = run_epoch(session, m, eval_op=m.train_op,
+          train_perplexity, _, _, _, _ = run_epoch(session, m, eval_op=m.train_op,
                                        verbose=True)
           print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-          valid_perplexity, _ = run_epoch(session, mvalid)
+          valid_perplexity, _, _, _, _ = run_epoch(session, mvalid)
           print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
       else:
         sv.saver.restore(session, FLAGS.restore_path)
 
-
-      test_perplexity, embedding = run_epoch(session, mtest)
+      test_perplexity, embedding, logits, one_hot_labels, output_layer = run_epoch(session, mtest)
       print("Test Perplexity: %.3f" % test_perplexity)
 
       if FLAGS.save_path:
@@ -836,6 +862,12 @@ def main(_):
         print("Saving embeddings to %s." % FLAGS.save_path)
         with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
           dill.dump(embedding, outputfile)
+        with open(os.path.join(FLAGS.save_path, "test_results.p"), "wb") as outputfile:
+          dill.dump({
+            "logits": logits,
+            "one_hot_labels": one_hot_labels,
+            "output_layer": output_layer
+            }, outputfile)
         print("Saved embeddings to %s." % save_path)
 
 
