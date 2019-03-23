@@ -113,8 +113,11 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
         "final_state": model.final_state,
         "embedding": model.embedding,
         "logits_mu": model.logits_mu,
-        "logits_sigma": model.logits_sigma
+
     }
+    if is_aleatoric:
+        fetches["logits_sigma"] = model.logits_sigma
+
     if eval_op is not None:
         fetches["eval_op"] = eval_op
 

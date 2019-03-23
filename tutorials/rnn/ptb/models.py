@@ -30,6 +30,7 @@ class PTBModel(object):
         self._input = input_
         self._rnn_params = None
         self._cell = None
+        self._logits_sigma = None
         self.batch_size = input_.batch_size
         self.num_steps = input_.num_steps
         self.embedding_size = config.embedding_size
