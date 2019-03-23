@@ -67,9 +67,10 @@ import numpy as np
 import tensorflow as tf
 
 import reader
-import util
 
-from tensorflow.contrib import distributions
+from models import PTBInput, PTBModel
+from configs import *
+
 
 flags = tf.flags
 logging = tf.logging
@@ -83,6 +84,8 @@ flags.DEFINE_string("save_path", None,
                     "Model output directory.")
 flags.DEFINE_bool("is_training", True,
                   "tells if the model must be trained or restore")
+flags.DEFINE_bool("is_aleatoric", False,
+                  "tells if the model must be trained for aleatoric uncertainty")
 flags.DEFINE_string("restore_path", None,
                     "Model input directory.")
 flags.DEFINE_bool("use_fp16", False,
@@ -92,784 +95,180 @@ flags.DEFINE_string("rnn_mode", None,
                     "BASIC, and BLOCK, representing cudnn_lstm, basic_lstm, "
                     "and lstm_block_cell classes.")
 FLAGS = flags.FLAGS
-BASIC = "basic"
-CUDNN = "cudnn"
-BLOCK = "block"
 
 
-def data_type():
-  return tf.float16 if FLAGS.use_fp16 else tf.float32
-
-
-class PTBInput(object):
-  """The input data."""
-
-  def __init__(self, config, data, name=None):
-    self.batch_size = batch_size = config.batch_size
-    self.num_steps = num_steps = config.num_steps
-    self.epoch_size = ((len(data) // batch_size) - 1) // num_steps
-    self.input_data, self.targets = reader.ptb_producer(
-        data, batch_size, num_steps, name=name)
-
-
-class PTBModel(object):
-  """The PTB model."""
-
-  def __init__(self, is_training, config, input_):
-    self._is_training = is_training
-    self._input = input_
-    self._rnn_params = None
-    self._cell = None
-    self.batch_size = input_.batch_size
-    self.num_steps = input_.num_steps
-    self.embedding_size = config.embedding_size
-    self.size = config.hidden_size
-    self.vocab_size = config.vocab_size
-
-    with tf.device("/cpu:0"):
-      self._embedding = tf.get_variable(
-          "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
-      inputs = tf.nn.embedding_lookup(self._embedding, input_.input_data)
-
-    if is_training and config.keep_prob < 1:
-      inputs = tf.nn.dropout(inputs, config.keep_prob)
-
-    output, state = self._build_rnn_graph(inputs, config, is_training)
-    self._output_layer = output
-
-    if config.tie_embeddings:
-      softmax_w = tf.transpose(self._embedding)
-      if config.use_projection:
-        linear_w = tf.get_variable(
-          "linear_w", [self.size, self.embedding_size], dtype=data_type())
-        linear_b = tf.get_variable("linear_b", [self.embedding_size], dtype=data_type())
-        output = tf.nn.xw_plus_b(output, linear_w, linear_b)
-    else:
-      softmax_w = tf.get_variable(
-          "softmax_w", [self.size, self.vocab_size], dtype=data_type())
-    softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=data_type())
-    logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
-    # Reshape logits to be a 3-D tensor for sequence loss
-    logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
-    self._logits = logits
-
-    sigma_w = tf.get_variable(
-      "sigma_w", [self.size, self.vocab_size], dtype=data_type())
-    sigma_b = tf.get_variable("sigma_b", [self.vocab_size], dtype=data_type())
-    logits_sigma = tf.nn.xw_plus_b(output, sigma_w, sigma_b)
-
-
-    # Reshape logits to be a 3-D tensor for sequence loss
-    logits_sigma = tf.reshape(logits_sigma, [self.batch_size, self.num_steps, self.vocab_size])
-    self._logits_sigma = logits_sigma
-
-    one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
-    self._one_hot_labels = one_hot_labels
-    if config.get_uncertainties:
-      crossent, loss = self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels)
-    else:
-      loss = self.crossentropy_loss(logits, input_.targets)
-      crossent = loss
-    # Update the cost
-    self._loss = tf.reduce_sum(loss)
-    self._cost = tf.reduce_sum(crossent)
-    self._final_state = state
-
-    if not is_training:
-      return
-
-    self._lr = tf.Variable(0.0, trainable=False)
-    tvars = tf.trainable_variables()
-    grads, _ = tf.clip_by_global_norm(tf.gradients(self._loss, tvars),
-                                      config.max_grad_norm)
-    optimizer = tf.train.GradientDescentOptimizer(self._lr)
-    self._train_op = optimizer.apply_gradients(
-        zip(grads, tvars),
-        global_step=tf.train.get_or_create_global_step())
-
-    self._new_lr = tf.placeholder(
-        tf.float32, shape=[], name="new_learning_rate")
-    self._lr_update = tf.assign(self._lr, self._new_lr)
-
-  def print_shape(self, tensor):
-    print('{} with shape {}'.format(tensor.name, tensor.get_shape()))
-
-  def crossentropy_loss(self, logits, targets):
-    num_classes = tf.shape(logits)[2]
-    logits_flat = tf.reshape(logits, [-1, num_classes])
-    targets = tf.reshape(targets, [-1])
-    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=targets, logits=logits_flat)
-    batch_size = tf.shape(logits)[0]
-    sequence_length = tf.shape(logits)[1]
-    crossent = tf.reshape(crossent, [batch_size, sequence_length])
-    crossent = tf.reduce_mean(crossent, axis=[0])
-    return crossent
-
-
-  def crossentropy_loss_with_uncert(self, logits_mu, logits_sigma, y_true):
-    num_samples = 100
-    epsilon = 1e-7
-    noise = tf.random_normal((lambda shape: (shape[0], num_samples * shape[1], shape[2]))(tf.shape(logits_sigma)))
-    z = tf.tile(logits_mu, [1, num_samples, 1]) + noise * tf.tile(logits_sigma, [1, num_samples, 1])
-    sample_probs = tf.nn.softmax(z, axis=-1)
-    sample_probs = tf.reduce_mean(
-      tf.reshape(sample_probs, (lambda shape: (shape[0], num_samples, -1, shape[2]))(tf.shape(logits_sigma))),
-      axis=1
-    )
-    sample_log_probs = -tf.reduce_sum(y_true * tf.log(sample_probs + epsilon), axis=-1)
-    sample_xentropy = tf.reduce_mean(sample_log_probs)
-
-    probs = tf.nn.softmax(logits_mu, axis=-1)
-    log_probs = -tf.reduce_sum(y_true * tf.log(probs + epsilon), axis=-1)
-    xentropy = tf.reduce_mean(log_probs)
-    return xentropy, sample_xentropy
-
-  def crossentropy_loss_with_uncert2(self, output, logits, targets):
-    T = 50
-    self.variance = tf.layers.dense(
-      output,
-      1,
-      name="variance",
-      activation=tf.nn.softplus)
-    std = tf.sqrt(self.variance)
-    variance_depressor = tf.exp(self.variance) - tf.ones_like(self.variance)
-    variance_depressor = tf.cast(variance_depressor, tf.float64)
-    variance_depressor = tf.reshape(variance_depressor, [-1])
-    logits_flat = tf.reshape(logits, [-1, self.vocab_size])
-    targets = tf.reshape(targets, [-1])
-    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=targets, logits=logits_flat)
-    crossent = tf.cast(crossent, tf.float64)
-    # shape: (T,)
-    iterable = tf.Variable(np.ones(T))
-    dist = distributions.Normal(loc=tf.zeros_like(std), scale=std)
-    monte_carlo_results = tf.map_fn(
-      self.gaussian_categorical_crossentropy(
-        targets,
-        logits_flat,
-        dist,
-        crossent,
-        self.vocab_size
-      ),
-      iterable, name='monte_carlo_results'
-    )
-    monte_carlo_results_mean = tf.reduce_mean(monte_carlo_results, axis=0)
-
-    variance_loss = tf.multiply(
-      monte_carlo_results_mean,
-      crossent
-    )
-    bayesian_categorical_crossentropy = tf.add(variance_loss, crossent)
-    bayesian_categorical_crossentropy = tf.add(bayesian_categorical_crossentropy, variance_depressor)
-    categorical_crossentropy_weight = 1.
-    bayesian_categorical_crossentropy_weight = .2
-    crossent = tf.reshape(crossent, [self.batch_size, self.num_steps])
-    bayesian_categorical_crossentropy = tf.reshape(bayesian_categorical_crossentropy, [self.batch_size, self.num_steps])
-    final_loss = tf.reduce_mean(
-      categorical_crossentropy_weight * crossent +
-      bayesian_categorical_crossentropy_weight * bayesian_categorical_crossentropy
-    )
-    crossent = tf.reduce_mean(crossent, axis=[0])
-
-    return crossent, final_loss
-
-    # for a single monte carlo simulation,
-    #   calculate categorical_crossentropy of
-    #   predicted logit values plus gaussian
-    #   noise vs true values.
-    # true - true values. Shape: (N, C)
-    # pred - predicted logit values. Shape: (N, C)
-    # dist - normal distribution to sample from. Shape: (N, C)
-    # undistorted_loss - the crossentropy loss without variance distortion. Shape: (N,)
-    # num_classes - the number of classes. C
-    # returns - total differences for all classes (N,)
-  def gaussian_categorical_crossentropy(self, true, pred, dist, undistorted_loss, num_classes):
-    def map_fn(i):
-      std_samples = tf.transpose(dist.sample(num_classes))
-      std_samples = tf.squeeze(std_samples)
-      distorted_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=true,
-        logits=pred + std_samples,
-        name="sparse_softmax_cross_entropy_with_logits"
-      )
-      distorted_loss = tf.cast(distorted_loss, tf.float64)
-      diff = undistorted_loss - distorted_loss
-      return -tf.nn.elu(diff)
-
-    return map_fn
-
-  def _build_rnn_graph(self, inputs, config, is_training):
-    if config.rnn_mode == CUDNN:
-      return self._build_rnn_graph_cudnn(inputs, config, is_training)
-    else:
-      return self._build_rnn_graph_lstm(inputs, config, is_training)
-
-  def _build_rnn_graph_cudnn(self, inputs, config, is_training):
-    """Build the inference graph using CUDNN cell."""
-    inputs = tf.transpose(inputs, [1, 0, 2])
-    self._cell = tf.contrib.cudnn_rnn.CudnnLSTM(
-        num_layers=config.num_layers,
-        num_units=config.hidden_size,
-        input_size=config.hidden_size,
-        dropout=1 - config.keep_prob if is_training else 0)
-    params_size_t = self._cell.params_size()
-    self._rnn_params = tf.get_variable(
-        "lstm_params",
-        initializer=tf.random_uniform(
-            [params_size_t], -config.init_scale, config.init_scale),
-        validate_shape=False)
-    c = tf.zeros([config.num_layers, self.batch_size, config.hidden_size],
-                 tf.float32)
-    h = tf.zeros([config.num_layers, self.batch_size, config.hidden_size],
-                 tf.float32)
-    self._initial_state = (tf.contrib.rnn.LSTMStateTuple(h=h, c=c),)
-    outputs, h, c = self._cell(inputs, h, c, self._rnn_params, is_training)
-    outputs = tf.transpose(outputs, [1, 0, 2])
-    outputs = tf.reshape(outputs, [-1, config.hidden_size])
-    return outputs, (tf.contrib.rnn.LSTMStateTuple(h=h, c=c),)
-
-  def _get_lstm_cell(self, config, is_training):
-    if config.rnn_mode == BASIC:
-      return tf.contrib.rnn.BasicLSTMCell(
-          config.hidden_size, forget_bias=0.0, state_is_tuple=True,
-          reuse=not is_training)
-    if config.rnn_mode == BLOCK:
-      return tf.contrib.rnn.LSTMBlockCell(
-          config.hidden_size, forget_bias=0.0)
-    raise ValueError("rnn_mode %s not supported" % config.rnn_mode)
-
-  def _build_rnn_graph_lstm(self, inputs, config, is_training):
-    """Build the inference graph using canonical LSTM cells."""
-    # Slightly better results can be obtained with forget gate biases
-    # initialized to 1 but the hyperparameters of the model would need to be
-    # different than reported in the paper.
-    def make_cell():
-      cell = self._get_lstm_cell(config, is_training)
-      if is_training and config.keep_prob < 1:
-        cell = tf.contrib.rnn.DropoutWrapper(
-            cell, output_keep_prob=config.keep_prob)
-      return cell
-
-    cell = tf.contrib.rnn.MultiRNNCell(
-        [make_cell() for _ in range(config.num_layers)], state_is_tuple=True)
-
-    self._initial_state = cell.zero_state(config.batch_size, data_type())
-    state = self._initial_state
-    # Simplified version of tf.nn.static_rnn().
-    # This builds an unrolled LSTM for tutorial purposes only.
-    # In general, use tf.nn.static_rnn() or tf.nn.static_state_saving_rnn().
-    #
-    # The alternative version of the code below is:
-    #
-    inputs = tf.unstack(inputs, num=self.num_steps, axis=1)
-    # sze of outputs  (batch_size, num_steps, hidden_size)
-    outputs, state = tf.nn.static_rnn(cell, inputs,
-                                      initial_state=self._initial_state)
-    # outputs = []
-    # with tf.variable_scope("RNN"):
-    #   for time_step in range(self.num_steps):
-    #     if time_step > 0: tf.get_variable_scope().reuse_variables()
-    #     (cell_output, state) = cell(inputs[:, time_step, :], state)
-    #     outputs.append(cell_output)
-
-    # reshape to (batch_size * num_steps, hidden_size)
-    output = tf.reshape(tf.concat(outputs, 1), [-1, config.hidden_size])
-    return output, state
-
-  def assign_lr(self, session, lr_value):
-    session.run(self._lr_update, feed_dict={self._new_lr: lr_value})
-
-  def export_ops(self, name):
-    """Exports ops to collections."""
-    self._name = name
-    ops = {util.with_prefix(self._name, "cost"): self._cost}
-    if self._is_training:
-      ops.update(lr=self._lr, new_lr=self._new_lr, lr_update=self._lr_update)
-      if self._rnn_params:
-        ops.update(rnn_params=self._rnn_params)
-    for name, op in ops.items():
-      tf.add_to_collection(name, op)
-    self._initial_state_name = util.with_prefix(self._name, "initial")
-    self._final_state_name = util.with_prefix(self._name, "final")
-    util.export_state_tuples(self._initial_state, self._initial_state_name)
-    util.export_state_tuples(self._final_state, self._final_state_name)
-
-  def import_ops(self):
-    """Imports ops from collections."""
-    if self._is_training:
-      self._train_op = tf.get_collection_ref("train_op")[0]
-      self._lr = tf.get_collection_ref("lr")[0]
-      self._new_lr = tf.get_collection_ref("new_lr")[0]
-      self._lr_update = tf.get_collection_ref("lr_update")[0]
-      rnn_params = tf.get_collection_ref("rnn_params")
-      if self._cell and rnn_params:
-        params_saveable = tf.contrib.cudnn_rnn.RNNParamsSaveable(
-            self._cell,
-            self._cell.params_to_canonical,
-            self._cell.canonical_to_params,
-            rnn_params,
-            base_variable_scope="Model/RNN")
-        tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, params_saveable)
-    self._cost = tf.get_collection_ref(util.with_prefix(self._name, "cost"))[0]
-    num_replicas = 1
-    self._initial_state = util.import_state_tuples(
-        self._initial_state, self._initial_state_name, num_replicas)
-    self._final_state = util.import_state_tuples(
-        self._final_state, self._final_state_name, num_replicas)
-
-  @property
-  def input(self):
-    return self._input
-
-  @property
-  def initial_state(self):
-    return self._initial_state
-
-  @property
-  def cost(self):
-    return self._cost
-
-  @property
-  def final_state(self):
-    return self._final_state
-
-  @property
-  def lr(self):
-    return self._lr
-
-  @property
-  def train_op(self):
-    return self._train_op
-
-  @property
-  def initial_state_name(self):
-    return self._initial_state_name
-
-  @property
-  def final_state_name(self):
-    return self._final_state_name
-
-  @property
-  def embedding(self):
-    return self._embedding
-
-  @property
-  def logits_sigma(self):
-    return self._logits_sigma
-
-  @property
-  def logits(self):
-    return self._logits
-
-  @property
-  def one_hot_labels(self):
-    return self._one_hot_labels
-
-  @property
-  def output_layer(self):
-    return self._output_layer
-
-
-class SmallConfig(object):
-  """Small config."""
-  init_scale = 0.1
-  learning_rate = 1.0
-  max_grad_norm = 5
-  num_layers = 2
-  num_steps = 20
-  hidden_size = 200
-  embedding_size = 200
-  max_epoch = 4
-  max_max_epoch = 13
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-
-class BayesSmallConfig(object):
-  """Small config."""
-  init_scale = 0.1
-  learning_rate = 1.0
-  max_grad_norm = 5
-  num_layers = 2
-  num_steps = 20
-  hidden_size = 200
-  embedding_size = 200
-  max_epoch = 4
-  max_max_epoch = 13
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = True
-
-
-class MediumConfig(object):
-  """Medium config."""
-  init_scale = 0.05
-  learning_rate = 1.0
-  max_grad_norm = 5
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 650
-  embedding_size = 650
-  max_epoch = 6
-  max_max_epoch = 39
-  keep_prob = 0.5
-  lr_decay = 0.8
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-
-class BayesMediumConfig(object):
-  """Medium config."""
-  init_scale = 0.05
-  learning_rate = 1.0
-  max_grad_norm = 5
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 650
-  embedding_size = 650
-  max_epoch = 6
-  max_max_epoch = 39
-  keep_prob = 0.5
-  lr_decay = 0.8
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = True
-
-
-class LargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 1500
-  embedding_size = 1500
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-
-class BayesLargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 1500
-  embedding_size = 1500
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = True
-
-
-class TiedLargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 1500
-  embedding_size = 1500
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = True
-  use_projection = False
-  get_uncertainties = False
-
-
-class NewLargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 600
-  embedding_size = 600
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-
-class NewTiedLargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 600
-  embedding_size = 600
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = True
-  use_projection = False
-  get_uncertainties = False
-
-
-class NewTiedLLargeConfig(object):
-  """Large config."""
-  init_scale = 0.04
-  learning_rate = 1.0
-  max_grad_norm = 10
-  num_layers = 2
-  num_steps = 35
-  hidden_size = 600
-  embedding_size = 600
-  max_epoch = 14
-  max_max_epoch = 55
-  keep_prob = 0.35
-  lr_decay = 1 / 1.15
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = True
-  use_projection = True
-  get_uncertainties = False
-
-
-class TestConfig(object):
-  """Tiny config, for testing."""
-  init_scale = 0.1
-  learning_rate = 1.0
-  max_grad_norm = 1
-  num_layers = 1
-  num_steps = 2
-  hidden_size = 2
-  embedding_size = 2
-  max_epoch = 1
-  max_max_epoch = 1
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 20
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-class NewTestConfig(object):
-  """Tiny config, for testing."""
-  init_scale = 0.1
-  learning_rate = 1.0
-  max_grad_norm = 1
-  num_layers = 1
-  num_steps = 2
-  hidden_size = 4
-  embedding_size = 4
-  max_epoch = 1
-  max_max_epoch = 1
-  keep_prob = 1.0
-  lr_decay = 0.5
-  batch_size = 10
-  vocab_size = 10000
-  rnn_mode = BLOCK
-  tie_embeddings = False
-  use_projection = False
-  get_uncertainties = False
-
-
-def run_epoch(session, model, eval_op=None, verbose=False):
-  """Runs the model on the given data."""
-  start_time = time.time()
-  costs = 0.0
-  iters = 0
-  state = session.run(model.initial_state)
-
-  fetches = {
-      "cost": model.cost,
-      "final_state": model.final_state,
-      "embedding": model.embedding,
-      "logits": model.logits,
-      "one_hot_labels": model.one_hot_labels,
-      "output_layer": model.output_layer
-  }
-  if eval_op is not None:
-    fetches["eval_op"] = eval_op
-
-  for step in range(model.input.epoch_size):
-    feed_dict = {}
-    for i, (c, h) in enumerate(model.initial_state):
-      feed_dict[c] = state[i].c
-      feed_dict[h] = state[i].h
-
-    vals = session.run(fetches, feed_dict)
-    cost = vals["cost"]
-    state = vals["final_state"]
-    embedding = vals["embedding"]
-    logits = vals["logits"]
-    one_hot_labels = vals["one_hot_labels"]
-    output_layer = vals["output_layer"]
-
-    costs += cost
-    iters += model.input.num_steps
-
-    if verbose and step % (model.input.epoch_size // 10) == 10:
-      print("%.3f perplexity: %.3f speed: %.0f wps" %
-            (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
-             iters * model.input.batch_size /
-             (time.time() - start_time)))
-
-  return np.exp(costs / iters), embedding, logits, one_hot_labels, output_layer
+def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
+    """Runs the model on the given data."""
+    start_time = time.time()
+    costs = 0.0
+    costs_sigma = 0.0
+    iters = 0
+    logits_mu = None
+    logits_sigma = None
+    state = session.run(model.initial_state)
+
+    fetches = {
+        "cost": model.cost,
+        "cost_sigma": model.cost_sigma,
+        "final_state": model.final_state,
+        "embedding": model.embedding,
+        "logits_mu": model.logits_mu,
+        "logits_sigma": model.logits_sigma
+    }
+    if eval_op is not None:
+        fetches["eval_op"] = eval_op
+
+    for step in range(model.input.epoch_size):
+        feed_dict = {}
+        for i, (c, h) in enumerate(model.initial_state):
+            feed_dict[c] = state[i].c
+            feed_dict[h] = state[i].h
+
+        vals = session.run(fetches, feed_dict)
+        cost = vals["cost"]
+        cost_sigma = vals["cost_sigma"]
+        state = vals["final_state"]
+        embedding = vals["embedding"]
+        if is_aleatoric:
+            logits_mu = vals["logits_mu"]
+            logits_sigma = vals["logits_sigma"]
+        costs += cost
+        costs_sigma += cost_sigma
+        iters += model.input.num_steps
+
+        if verbose and step % (model.input.epoch_size // 10) == 10:
+            print("%.3f perplexity: %.3f perplexity_sigma %.3f speed: %.0f wps" %
+                  (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
+                   np.exp(costs_sigma / iters),
+                   iters * model.input.batch_size /
+                   (time.time() - start_time)))
+
+    return np.exp(costs / iters), np.exp(costs_sigma / iters), logits_mu, logits_sigma, embedding
 
 
 def get_config():
-  """Get model config."""
-  config = None
-  if FLAGS.model == "small":
-    config = SmallConfig()
-  elif FLAGS.model == "medium":
-    config = MediumConfig()
-  elif FLAGS.model == "large":
-    config = LargeConfig()
-  elif FLAGS.model == "baseline":
-    config = LargeConfig()
-  elif FLAGS.model == "test":
-    config = TestConfig()
-  elif FLAGS.model == "newtest":
-    config = NewTestConfig()
-  elif FLAGS.model == "baselinetied":
-    config = TiedLargeConfig()
-  elif FLAGS.model == "baselinebayes":
-    config = BayesMediumConfig()
-  elif FLAGS.model == "nontied":
-    config = NewLargeConfig()
-  elif FLAGS.model == "tied":
-    config = NewTiedLargeConfig()
-  elif FLAGS.model == "tiedl":
-    config = NewTiedLLargeConfig()
-  else:
-    raise ValueError("Invalid model: %s", FLAGS.model)
-  if FLAGS.rnn_mode:
-    config.rnn_mode = FLAGS.rnn_mode
-  return config
+    """Get model config."""
+    if FLAGS.model == "small":
+        config = SmallConfig()
+    elif FLAGS.model == "medium":
+        config = MediumConfig()
+    elif FLAGS.model == "large":
+        config = LargeConfig()
+    elif FLAGS.model == "baseline":
+        config = LargeConfig()
+    elif FLAGS.model == "test":
+        config = TestConfig()
+    elif FLAGS.model == "newtest":
+        config = NewTestConfig()
+    elif FLAGS.model == "baselinetied":
+        config = TiedLargeConfig()
+    elif FLAGS.model == "baselinebayes":
+        config = BayesMediumConfig()
+    elif FLAGS.model == "nontied":
+        config = NewLargeConfig()
+    elif FLAGS.model == "tied":
+        config = NewTiedLargeConfig()
+    elif FLAGS.model == "tiedl":
+        config = NewTiedLLargeConfig()
+    else:
+        raise ValueError("Invalid model: %s", FLAGS.model)
+    if FLAGS.rnn_mode:
+        config.rnn_mode = FLAGS.rnn_mode
+    return config
 
 
 def main(_):
-  if not FLAGS.data_path:
-    raise ValueError("Must set --data_path to PTB data directory")
+    if not FLAGS.data_path:
+        raise ValueError("Must set --data_path to PTB data directory")
 
-  raw_data = reader.ptb_raw_data(FLAGS.data_path)
-  train_data, valid_data, test_data, _ = raw_data
+    if FLAGS.save_path:
+        tf.gfile.MakeDirs(FLAGS.save_path)
 
-  config = get_config()
-  eval_config = get_config()
-  eval_config.batch_size = 1
-  eval_config.num_steps = 1
+    raw_data = reader.ptb_raw_data(FLAGS.data_path)
+    train_data, valid_data, test_data, _ = raw_data
 
-  with tf.Graph().as_default():
-    initializer = tf.random_uniform_initializer(-config.init_scale,
-                                                config.init_scale)
+    config = get_config()
+    eval_config = get_config()
+    eval_config.batch_size = 1
+    eval_config.num_steps = 1
 
-    with tf.name_scope("Train"):
-      train_input = PTBInput(config=config, data=train_data, name="TrainInput")
-      with tf.variable_scope("Model", reuse=None, initializer=initializer):
-        m = PTBModel(is_training=True, config=config, input_=train_input)
-      tf.summary.scalar("Training Loss", m.cost)
-      tf.summary.scalar("Learning Rate", m.lr)
+    with tf.Graph().as_default() as graph:
+        initializer = tf.random_uniform_initializer(-config.init_scale,
+                                                    config.init_scale)
 
-    with tf.name_scope("Valid"):
-      valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
-      with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
-      tf.summary.scalar("Validation Loss", mvalid.cost)
+        with tf.name_scope("Train"):
+            train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+            with tf.variable_scope("Model", reuse=None, initializer=initializer):
+                m = PTBModel(is_training=True, is_aleatoric=FLAGS.is_aleatoric, config=config, input_=train_input)
+            tf.summary.scalar("Training Loss", m.cost)
+            tf.summary.scalar("Learning Rate", m.lr)
 
-    with tf.name_scope("Test"):
-      test_input = PTBInput(
-          config=eval_config, data=test_data, name="TestInput")
-      with tf.variable_scope("Model", reuse=True, initializer=initializer):
-        mtest = PTBModel(is_training=False, config=eval_config,
-                         input_=test_input)
+        with tf.name_scope("Valid"):
+            valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
+            with tf.variable_scope("Model", reuse=True, initializer=initializer):
+                mvalid = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric, config=config, input_=valid_input)
+            tf.summary.scalar("Validation Loss", mvalid.cost)
 
-    soft_placement = False
-    sv = tf.train.Supervisor(logdir=FLAGS.save_path)
-    config_proto = tf.ConfigProto(allow_soft_placement=soft_placement)
-    with sv.managed_session(config=config_proto) as session:
-      if FLAGS.is_training:
-        for i in range(config.max_max_epoch):
-          lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
-          m.assign_lr(session, config.learning_rate * lr_decay)
+        with tf.name_scope("Test"):
+            test_input = PTBInput(
+                config=eval_config, data=test_data, name="TestInput")
+            with tf.variable_scope("Model", reuse=True, initializer=initializer):
+                mtest = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric, config=eval_config,
+                                 input_=test_input)
 
-          print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-          train_perplexity, _, _, _, _ = run_epoch(session, m, eval_op=m.train_op,
-                                       verbose=True)
-          print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-          valid_perplexity, _, _, _, _ = run_epoch(session, mvalid)
-          print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
-      else:
-        sv.saver.restore(session, FLAGS.restore_path)
+        # Add ops to save and restore all the variables.
+        vars = {var.name[:-2]: var for var in tf.global_variables() if "sigma" not in var.name}
+        saver = tf.train.Saver(vars)
 
-      test_perplexity, embedding, logits, one_hot_labels, output_layer = run_epoch(session, mtest)
-      print("Test Perplexity: %.3f" % test_perplexity)
+        with tf.Session(graph=graph) as session:
+            session.run(tf.global_variables_initializer())
+            coord = tf.train.Coordinator()
+            threads = tf.train.start_queue_runners(session)
+            if FLAGS.is_training:
+                if FLAGS.is_aleatoric:
+                    saver.restore(session, FLAGS.restore_path)
+                for i in range(config.max_max_epoch):
+                    lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+                    m.assign_lr(session, config.learning_rate * lr_decay)
 
-      if FLAGS.save_path:
-        print("Saving model to %s." % FLAGS.save_path)
-        save_path = sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
-        print("Saved model to %s." % save_path)
-        print("Saving embeddings to %s." % FLAGS.save_path)
-        with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
-          dill.dump(embedding, outputfile)
-        with open(os.path.join(FLAGS.save_path, "test_results.p"), "wb") as outputfile:
-          dill.dump({
-            "logits": logits,
-            "one_hot_labels": one_hot_labels,
-            "output_layer": output_layer
-            }, outputfile)
-        print("Saved embeddings to %s." % save_path)
+                    print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+                    train_perplexity, train_perplexity_sigma, logits_mu, logits_sigma, _ = run_epoch(
+                        session, m, eval_op=m.train_op,verbose=True, is_aleatoric=FLAGS.is_aleatoric)
+                    print("Epoch: %d Train Perplexity: %.3f Perplexity sigma: %.3f" %
+                          (i + 1, train_perplexity, train_perplexity_sigma))
+                    if FLAGS.is_aleatoric:
+                        print("Epoch: mu: %s sigma %s" %
+                              (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
+                    valid_perplexity, valid_perplexity_sigma, logits_mu, logits_sigma, _ = run_epoch(session, mvalid,
+                                                                                                     is_aleatoric=FLAGS.is_aleatoric)
+                    print("Epoch: %d Valid Perplexity: %.3f Perplexity sigma: %.3f" %
+                          (i + 1, valid_perplexity, valid_perplexity_sigma
+                           ))
+                    if FLAGS.is_aleatoric:
+                        print("Epoch: mu: %s sigma %s" %
+                              (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
+            else:
+                saver.restore(session, FLAGS.restore_path)
+
+            test_perplexity, test_perplexity_sigma, logits_mu, logits_sigma, embedding = run_epoch(session, mtest,
+                                                                                                   is_aleatoric=FLAGS.is_aleatoric)
+            print("Test Perplexity: %.3f Perplexity sigma: %.3f" %
+                  (test_perplexity, test_perplexity_sigma))
+            if FLAGS.is_aleatoric:
+                print("Epoch: mu: %s sigma %s" %
+                      (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
+
+            if FLAGS.save_path:
+                print("Saving model to %s." % FLAGS.save_path + '/model')
+                save_path = saver.save(session, FLAGS.save_path + '/model')
+                print("Saved model to %s." % save_path)
+                print("Saving embeddings to %s." % FLAGS.save_path)
+                with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
+                    dill.dump(embedding, outputfile)
+                print("Saved embeddings to %s." % save_path)
+            coord.request_stop()
+            coord.join(threads, ignore_live_threads=True)
 
 
 if __name__ == "__main__":
-  tf.app.run()
+    tf.app.run()
