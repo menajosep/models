@@ -232,7 +232,7 @@ class NewTestConfig(object):
     hidden_size = 4
     embedding_size = 4
     max_epoch = 1
-    max_max_epoch = 2
+    max_max_epoch = 1
     keep_prob = 1.0
     lr_decay = 0.5
     batch_size = 10

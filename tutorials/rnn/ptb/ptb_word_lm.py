@@ -94,10 +94,12 @@ flags.DEFINE_string("rnn_mode", None,
                     "The low level implementation of lstm cell: one of CUDNN, "
                     "BASIC, and BLOCK, representing cudnn_lstm, basic_lstm, "
                     "and lstm_block_cell classes.")
+flags.DEFINE_integer("num_samples", 100,
+                     "Number of sampls for aleatoric ucnertainty")
 FLAGS = flags.FLAGS
 
 
-def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
+def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, is_training=True):
     """Runs the model on the given data."""
     start_time = time.time()
     costs = 0.0
@@ -105,6 +107,12 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
     iters = 0
     logits_mu = None
     logits_sigma = None
+    sigma_entropies = None
+    errors = None
+    baselines = None
+    embedding = None
+    labels = None
+    predictions = None
     state = session.run(model.initial_state)
 
     fetches = {
@@ -113,10 +121,14 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
         "final_state": model.final_state,
         "embedding": model.embedding,
         "logits_mu": model.logits_mu,
+        "probs": model.probs,
+        "labels": model.labels
 
     }
     if is_aleatoric:
         fetches["logits_sigma"] = model.logits_sigma
+        fetches["sigma_entropy"] = model.sigma_entropy
+        fetches["error"] = model.error
 
     if eval_op is not None:
         fetches["eval_op"] = eval_op
@@ -135,6 +147,31 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
         if is_aleatoric:
             logits_mu = vals["logits_mu"]
             logits_sigma = vals["logits_sigma"]
+            if not is_training:
+                batch_probs = vals["probs"]
+                batch_prob_argmax = batch_probs.argmax(axis=-1)
+                batch_winner_probs = np.array([prob[batch_prob_argmax[i]] for i, prob in enumerate(batch_probs)])
+                batch_baseline = np.minimum(1-batch_winner_probs, batch_winner_probs)
+                if labels is None:
+                    labels = vals["labels"]
+                else:
+                    labels = np.append(labels, vals["labels"], axis=0)
+                if predictions is None:
+                    predictions = batch_prob_argmax
+                else:
+                    predictions = np.append(predictions, batch_prob_argmax, axis=0)
+                if baselines is None:
+                    baselines = batch_baseline
+                else:
+                    baselines = np.append(baselines, batch_baseline, axis=0)
+                if sigma_entropies is None:
+                    sigma_entropies = vals["sigma_entropy"]
+                else:
+                    sigma_entropies = np.append(sigma_entropies, vals["sigma_entropy"], axis=0)
+                if errors is None:
+                    errors = vals["error"]
+                else:
+                    errors = np.append(errors, vals["error"], axis=0)
         costs += cost
         costs_sigma += cost_sigma
         iters += model.input.num_steps
@@ -146,7 +183,10 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False):
                    iters * model.input.batch_size /
                    (time.time() - start_time)))
 
-    return np.exp(costs / iters), np.exp(costs_sigma / iters), logits_mu, logits_sigma, embedding
+    return np.exp(costs / iters), np.exp(costs_sigma / iters), \
+           logits_mu, logits_sigma, \
+           embedding, \
+           baselines, errors, sigma_entropies, labels, predictions
 
 
 def get_config():
@@ -202,22 +242,26 @@ def main(_):
         with tf.name_scope("Train"):
             train_input = PTBInput(config=config, data=train_data, name="TrainInput")
             with tf.variable_scope("Model", reuse=None, initializer=initializer):
-                m = PTBModel(is_training=True, is_aleatoric=FLAGS.is_aleatoric, config=config, input_=train_input)
+                m = PTBModel(is_training=True, is_aleatoric=FLAGS.is_aleatoric,
+                             config=config, input_=train_input, num_samples=FLAGS.num_samples)
             tf.summary.scalar("Training Loss", m.cost)
             tf.summary.scalar("Learning Rate", m.lr)
 
         with tf.name_scope("Valid"):
             valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
             with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mvalid = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric, config=config, input_=valid_input)
+                mvalid = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric,
+                                  config=config, input_=valid_input, num_samples=FLAGS.num_samples)
             tf.summary.scalar("Validation Loss", mvalid.cost)
 
         with tf.name_scope("Test"):
             test_input = PTBInput(
                 config=eval_config, data=test_data, name="TestInput")
             with tf.variable_scope("Model", reuse=True, initializer=initializer):
-                mtest = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric, config=eval_config,
-                                 input_=test_input)
+                mtest = PTBModel(is_training=False, is_aleatoric=FLAGS.is_aleatoric,
+                                 config=eval_config,
+                                 input_=test_input,
+                                 num_samples=FLAGS.num_samples)
 
         # Add ops to save and restore all the variables.
         vars = {var.name[:-2]: var for var in tf.global_variables() if "sigma" not in var.name}
@@ -235,15 +279,16 @@ def main(_):
                     m.assign_lr(session, config.learning_rate * lr_decay)
 
                     print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-                    train_perplexity, train_perplexity_sigma, logits_mu, logits_sigma, _ = run_epoch(
-                        session, m, eval_op=m.train_op,verbose=True, is_aleatoric=FLAGS.is_aleatoric)
+                    train_perplexity, train_perplexity_sigma, logits_mu, logits_sigma, _, _, _, _, _, _ = run_epoch(
+                        session, m, eval_op=m.train_op,verbose=True, is_aleatoric=FLAGS.is_aleatoric, is_training=True)
                     print("Epoch: %d Train Perplexity: %.3f Perplexity sigma: %.3f" %
                           (i + 1, train_perplexity, train_perplexity_sigma))
                     if FLAGS.is_aleatoric:
                         print("Epoch: mu: %s sigma %s" %
                               (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
-                    valid_perplexity, valid_perplexity_sigma, logits_mu, logits_sigma, _ = run_epoch(session, mvalid,
-                                                                                                     is_aleatoric=FLAGS.is_aleatoric)
+                    valid_perplexity, valid_perplexity_sigma, logits_mu, logits_sigma, _, _, _, _, _, _ = run_epoch(session, mvalid,
+                                                                                                     is_aleatoric=FLAGS.is_aleatoric,
+                                                                                                                    is_training = True)
                     print("Epoch: %d Valid Perplexity: %.3f Perplexity sigma: %.3f" %
                           (i + 1, valid_perplexity, valid_perplexity_sigma
                            ))
@@ -253,8 +298,10 @@ def main(_):
             else:
                 saver.restore(session, FLAGS.restore_path)
 
-            test_perplexity, test_perplexity_sigma, logits_mu, logits_sigma, embedding = run_epoch(session, mtest,
-                                                                                                   is_aleatoric=FLAGS.is_aleatoric)
+            test_perplexity, test_perplexity_sigma, \
+            logits_mu, logits_sigma, embedding, baselines, errors, sigma_entropies, labels, predictions = run_epoch(session, mtest,
+                                                                                   is_aleatoric=FLAGS.is_aleatoric,
+                                                                                               is_training=False)
             print("Test Perplexity: %.3f Perplexity sigma: %.3f" %
                   (test_perplexity, test_perplexity_sigma))
             if FLAGS.is_aleatoric:
@@ -269,6 +316,17 @@ def main(_):
                 with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
                     dill.dump(embedding, outputfile)
                 print("Saved embeddings to %s." % save_path)
+                if FLAGS.is_aleatoric:
+                    print("Saving sigma entropies and mu errors to %s." % FLAGS.save_path)
+                    with open(os.path.join(FLAGS.save_path, "aleatoric_results.p"), "wb") as outputfile:
+                        dill.dump({
+                            "sigma_entropies": sigma_entropies,
+                            "errors": errors,
+                            "baselines": baselines,
+                            "labels": labels,
+                            "predictions": predictions
+                        }, outputfile)
+                    print("Saved sigma entropies and mu errors to %s." % save_path)
             coord.request_stop()
             coord.join(threads, ignore_live_threads=True)
 
