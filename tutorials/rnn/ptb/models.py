@@ -4,6 +4,7 @@ import reader
 import util
 
 from configs import CUDNN, BASIC, BLOCK
+import numpy as np
 
 
 def data_type(use_fp16=False):
@@ -66,10 +67,21 @@ class PTBModel(object):
         logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
 
         if is_aleatoric:
-            sigma_w = tf.get_variable(
-                "sigma_w", [self.size, self.vocab_size], dtype=data_type())
-            sigma_b = tf.get_variable("sigma_b", [self.vocab_size], dtype=data_type())
-            logits_sigma = tf.nn.xw_plus_b(output, sigma_w, sigma_b)
+            sigma_w1 = tf.get_variable(
+                "sigma_w1", [self.size, self.vocab_size//4], dtype=data_type())
+            sigma_b1 = tf.get_variable("sigma_b1", [self.vocab_size//4], dtype=data_type())
+            sigma1 = tf.nn.xw_plus_b(output, sigma_w1, sigma_b1)
+            sigma1 = tf.nn.selu(sigma1)
+            sigma_w2 = tf.get_variable(
+                "sigma_w2", [self.vocab_size//4, self.vocab_size//2], dtype=data_type())
+            sigma_b2 = tf.get_variable("sigma_b2", [self.vocab_size//2], dtype=data_type())
+            sigma2 = tf.nn.xw_plus_b(sigma1, sigma_w2, sigma_b2)
+            sigma2 = tf.nn.selu(sigma2)
+            sigma_w3 = tf.get_variable(
+                "sigma_w3", [self.vocab_size//2, self.vocab_size], dtype=data_type())
+            sigma_b3 = tf.get_variable("sigma_b3", [self.vocab_size], dtype=data_type())
+            logits_sigma = tf.nn.xw_plus_b(sigma2, sigma_w3, sigma_b3)
+            logits_sigma = tf.abs(logits_sigma)
             self._logits_sigma = logits_sigma
             # Reshape logits to be a 3-D tensor for sequence loss
             logits_sigma = tf.reshape(logits_sigma, [self.batch_size, self.num_steps, self.vocab_size])
@@ -124,19 +136,21 @@ class PTBModel(object):
         num_classes = tf.shape(logits_mu)[2]
         logits_mu_flat = tf.reshape(logits_mu, [-1, num_classes])
         logits_sigma_flat = tf.reshape(logits_sigma, [-1, num_classes])
+        logits_phi = tf.expand_dims(logits_mu_flat, axis=0)
+        logits_psi = tf.expand_dims(logits_sigma_flat, axis=0)
         targets = tf.reshape(y_true, [-1, num_classes])
-        noise = tf.random_normal((self.num_samples*batch_size*sequence_length, num_classes))
-        z = tf.tile(logits_mu_flat, [self.num_samples, 1]) + noise * tf.tile(logits_sigma_flat, [self.num_samples, 1])
+        noise = tf.random_normal((self.num_samples, batch_size*sequence_length, num_classes))
+        z = tf.tile(logits_phi, [self.num_samples, 1, 1]) + noise * tf.tile(logits_psi, [self.num_samples, 1, 1])
         sample_probs = tf.nn.softmax(z, axis=-1)
-        sigma_entropy = tf.reduce_sum(-sample_probs*tf.log(sample_probs), axis=-1)
+        sample_log_probs = tf.nn.log_softmax(z, axis=-1)
+        sigma_entropy = tf.reduce_sum(-sample_probs*sample_log_probs, axis=-1)
         sigma_entropy = tf.reduce_mean(tf.reshape(sigma_entropy, (self.num_samples,batch_size*sequence_length)), axis=0)
-        sample_probs = tf.reduce_mean(
-            tf.reshape(sample_probs, (self.num_samples, batch_size*sequence_length, num_classes)),
-            axis=0
-        )
-        sample_log_probs = -tf.reduce_sum(targets * tf.log(sample_probs + epsilon), axis=-1)
-        sample_log_probs = tf.reshape(sample_log_probs, [batch_size, sequence_length])
-        sample_xentropy = tf.reduce_mean(sample_log_probs, axis=0)
+
+
+        sample_exp_probs = tf.reduce_logsumexp(sample_log_probs, axis=0) - np.log(self.num_samples)
+        sample_xentropy = -tf.reduce_sum(targets * sample_exp_probs, axis=-1)
+        sample_xentropy = tf.reshape(sample_xentropy, [batch_size, sequence_length])
+        sample_xentropy = tf.reduce_mean(sample_xentropy, axis=0)
 
         probs = tf.nn.softmax(logits_mu_flat, axis=-1)
         log_probs = tf.log(probs + epsilon)
