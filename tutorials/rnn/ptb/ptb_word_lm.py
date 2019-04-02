@@ -105,32 +105,28 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, i
     costs = 0.0
     costs_sigma = 0.0
     iters = 0
-    logits_mu = None
-    logits_sigma = None
-    sigma_entropies = None
     errors = None
     baselines = None
     embedding = None
     labels = None
     predictions = None
     mu_entropies = None
+    votings = None
     state = session.run(model.initial_state)
 
     fetches = {
         "cost": model.cost,
         "cost_sigma": model.cost_sigma,
         "final_state": model.final_state,
-        "embedding": model.embedding,
-        "logits_mu": model.logits_mu,
-        "probs": model.probs,
-        "labels": model.labels
+        "embedding": model.embedding
 
     }
     if is_aleatoric:
-        fetches["logits_sigma"] = model.logits_sigma
-        fetches["sigma_entropy"] = model.sigma_entropy
+        fetches["labels"] = model.labels
+        fetches["probs"] = model.probs
         fetches["error"] = model.error
         fetches["mu_entropy"] = model.mu_entropy
+        fetches["voting"] = model.voting
 
     if eval_op is not None:
         fetches["eval_op"] = eval_op
@@ -147,8 +143,6 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, i
         state = vals["final_state"]
         embedding = vals["embedding"]
         if is_aleatoric:
-            logits_mu = vals["logits_mu"]
-            logits_sigma = vals["logits_sigma"]
             if not is_training:
                 batch_probs = vals["probs"]
                 batch_prob_argmax = batch_probs.argmax(axis=-1)
@@ -166,10 +160,6 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, i
                     baselines = batch_baseline
                 else:
                     baselines = np.append(baselines, batch_baseline, axis=0)
-                if sigma_entropies is None:
-                    sigma_entropies = vals["sigma_entropy"]
-                else:
-                    sigma_entropies = np.append(sigma_entropies, vals["sigma_entropy"], axis=0)
                 if mu_entropies is None:
                     mu_entropies = vals["mu_entropy"]
                 else:
@@ -178,6 +168,10 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, i
                     errors = vals["error"]
                 else:
                     errors = np.append(errors, vals["error"], axis=0)
+                if votings is None:
+                    votings = vals["voting"]
+                else:
+                    votings = np.append(votings, vals["voting"], axis=0)
         costs += cost
         costs_sigma += cost_sigma
         iters += model.input.num_steps
@@ -190,9 +184,9 @@ def run_epoch(session, model, eval_op=None, verbose=False, is_aleatoric=False, i
                    (time.time() - start_time)))
 
     return np.exp(costs / iters), np.exp(costs_sigma / iters), \
-           logits_mu, logits_sigma, \
            embedding, \
-           baselines, errors, sigma_entropies, labels, predictions, mu_entropies
+           baselines, errors, labels, \
+           predictions, mu_entropies, votings
 
 
 def get_config():
@@ -285,34 +279,27 @@ def main(_):
                     m.assign_lr(session, config.learning_rate * lr_decay)
 
                     print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-                    train_perplexity, train_perplexity_sigma, logits_mu, logits_sigma, _, _, _, _, _, _, _ = \
+                    train_perplexity, train_perplexity_sigma, _, _, _, _, _, _, _ = \
                         run_epoch(session, m, eval_op=m.train_op,verbose=True, is_aleatoric=FLAGS.is_aleatoric,
                                   is_training=True)
                     print("Epoch: %d Train Perplexity: %.3f Perplexity sigma: %.3f" %
                           (i + 1, train_perplexity, train_perplexity_sigma))
-                    if FLAGS.is_aleatoric:
-                        print("Epoch: mu: %s sigma %s" %
-                              (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
-                    valid_perplexity, valid_perplexity_sigma, logits_mu, logits_sigma, _, _, _, _, _, _, _ = \
+                    valid_perplexity, valid_perplexity_sigma, _, _, _, _, _, _, _ = \
                         run_epoch(session, mvalid, is_aleatoric=FLAGS.is_aleatoric, is_training=True)
                     print("Epoch: %d Valid Perplexity: %.3f Perplexity sigma: %.3f" %
                           (i + 1, valid_perplexity, valid_perplexity_sigma
                            ))
-                    if FLAGS.is_aleatoric:
-                        print("Epoch: mu: %s sigma %s" %
-                              (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
             else:
                 saver.restore(session, FLAGS.restore_path)
 
             test_perplexity, test_perplexity_sigma, \
-            logits_mu, logits_sigma, embedding, baselines, \
-            errors, sigma_entropies, labels, \
-            predictions, mu_entropies = run_epoch(session, mtest,is_aleatoric=FLAGS.is_aleatoric, is_training=False)
+            embedding, baselines, \
+            errors, labels, \
+            predictions, mu_entropies, votings = run_epoch(session, mtest,
+                                                           is_aleatoric=FLAGS.is_aleatoric,
+                                                           is_training=False)
             print("Test Perplexity: %.3f Perplexity sigma: %.3f" %
                   (test_perplexity, test_perplexity_sigma))
-            if FLAGS.is_aleatoric:
-                print("Epoch: mu: %s sigma %s" %
-                      (str(logits_mu[0][:10]), str(logits_sigma[0][:10])))
 
             if FLAGS.save_path:
                 print("Saving model to %s." % FLAGS.save_path + '/model')
@@ -326,12 +313,12 @@ def main(_):
                     print("Saving sigma entropies and mu errors to %s." % FLAGS.save_path)
                     with open(os.path.join(FLAGS.save_path, "aleatoric_results.p"), "wb") as outputfile:
                         dill.dump({
-                            "sigma_entropies": sigma_entropies,
                             "errors": errors,
                             "baselines": baselines,
                             "labels": labels,
                             "predictions": predictions,
-                            "mu_entropies": mu_entropies
+                            "mu_entropies": mu_entropies,
+                            "votings": votings
                         }, outputfile)
                     print("Saved sigma entropies and mu errors to %s." % save_path)
             coord.request_stop()

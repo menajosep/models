@@ -88,7 +88,7 @@ class PTBModel(object):
 
             one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
             self._labels = tf.reshape(input_.targets, [-1])
-            crossent, loss, self._probs, self._error, self._sigma_entropy, self._mu_entropy = \
+            crossent, loss, self._probs, self._error, self._mu_entropy, self._voting = \
                 self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels)
         else:
             loss = self.crossentropy_loss(logits, input_.targets)
@@ -141,16 +141,21 @@ class PTBModel(object):
         targets = tf.reshape(y_true, [-1, num_classes])
         noise = tf.random_normal((self.num_samples, batch_size*sequence_length, num_classes))
         z = tf.tile(logits_phi, [self.num_samples, 1, 1]) + noise * tf.tile(logits_psi, [self.num_samples, 1, 1])
-        sample_probs = tf.nn.softmax(z, axis=-1)
-        sample_log_probs = tf.nn.log_softmax(z, axis=-1)
-        sigma_entropy = tf.reduce_sum(-sample_probs*sample_log_probs, axis=-1)
-        sigma_entropy = tf.reduce_mean(tf.reshape(sigma_entropy, (self.num_samples,batch_size*sequence_length)), axis=0)
-
-
-        sample_exp_probs = tf.reduce_logsumexp(sample_log_probs, axis=0) - np.log(self.num_samples)
-        sample_xentropy = -tf.reduce_sum(targets * sample_exp_probs, axis=-1)
+        z_probs = tf.nn.softmax(z, axis=-1)
+        e_probs = tf.reduce_mean(z_probs, axis=0)
+        log_probs = tf.log(e_probs)
+        sample_xentropy = -(tf.reduce_sum(targets * log_probs, axis=-1))
         sample_xentropy = tf.reshape(sample_xentropy, [batch_size, sequence_length])
         sample_xentropy = tf.reduce_mean(sample_xentropy, axis=0)
+
+
+        voting = tf.argmax(z, axis=-1, output_type=tf.int32)
+        voting = tf.reshape(voting, (lambda shape: (self.num_samples, -1))(tf.shape(voting)))
+        voting = tf.one_hot(voting, axis=-1, depth=2)
+        voting = tf.reduce_sum(voting, axis=0)
+        winner_classes = tf.argmax(logits_mu_flat, axis=1)
+        winner_classes = tf.one_hot(winner_classes, axis=-1, depth=2)
+        voting = tf.reduce_sum(voting * winner_classes, axis=-1)
 
         probs = tf.nn.softmax(logits_mu_flat, axis=-1)
         log_probs = tf.log(probs + epsilon)
@@ -159,7 +164,7 @@ class PTBModel(object):
         error = cross_entropy
         cross_entropy = tf.reshape(cross_entropy, [batch_size, sequence_length])
         cross_entropy = tf.reduce_mean(cross_entropy, axis=0)
-        return cross_entropy, sample_xentropy, probs, error, sigma_entropy, mu_entropy
+        return cross_entropy, sample_xentropy, probs, error, mu_entropy, voting
 
     def _build_rnn_graph(self, inputs, config, is_training):
         return self._build_rnn_graph_lstm(inputs, config, is_training)
@@ -298,10 +303,6 @@ class PTBModel(object):
         return self._cost_sigma
 
     @property
-    def sigma_entropy(self):
-        return self._sigma_entropy
-
-    @property
     def error(self):
         return self._error
 
@@ -316,3 +317,7 @@ class PTBModel(object):
     @property
     def mu_entropy(self):
         return self._mu_entropy
+
+    @property
+    def voting(self):
+        return self._voting
