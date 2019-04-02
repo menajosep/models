@@ -40,10 +40,10 @@ class PTBModel(object):
         self.vocab_size = config.vocab_size
         self.num_samples = num_samples
 
-        #with tf.device("/cpu:0"):
-        self._embedding = tf.get_variable(
-            "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
-        inputs = tf.nn.embedding_lookup(self._embedding, input_.input_data)
+        with tf.device("/cpu:0"):
+            self._embedding = tf.get_variable(
+                "embedding", [self.vocab_size, self.embedding_size], dtype=data_type())
+            inputs = tf.nn.embedding_lookup(self._embedding, input_.input_data)
 
         if is_training and config.keep_prob < 1:
             inputs = tf.nn.dropout(inputs, config.keep_prob)
