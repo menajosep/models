@@ -88,7 +88,7 @@ class PTBModel(object):
             one_hot_labels = tf.one_hot(input_.targets, depth=self.vocab_size, dtype=tf.float32)
             self._labels = tf.reshape(input_.targets, [-1])
             crossent, loss, self._probs, self._error, self._mu_entropy, self._voting = \
-                self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels)
+                self.crossentropy_loss_with_uncert(logits, logits_sigma, one_hot_labels, is_training)
         else:
             loss = self.crossentropy_loss(logits, input_.targets)
             crossent = loss
