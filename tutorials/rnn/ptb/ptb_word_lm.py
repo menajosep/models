@@ -228,7 +228,7 @@ def main(_):
         tf.gfile.MakeDirs(FLAGS.save_path)
 
     raw_data = reader.ptb_raw_data(FLAGS.data_path)
-    train_data, valid_data, test_data, _ = raw_data
+    train_data, valid_data, test_data, vocabulary, word_to_id = raw_data
 
     config = get_config()
     eval_config = get_config()
@@ -309,6 +309,8 @@ def main(_):
                 with open(os.path.join(FLAGS.save_path, "embeddings.p"), "wb") as outputfile:
                     dill.dump(embedding, outputfile)
                 print("Saved embeddings to %s." % save_path)
+                print("Saving vocabulary to %s." % FLAGS.save_path)
+
                 if FLAGS.is_aleatoric:
                     print("Saving sigma entropies and mu errors to %s." % FLAGS.save_path)
                     with open(os.path.join(FLAGS.save_path, "aleatoric_results.p"), "wb") as outputfile:
@@ -321,6 +323,10 @@ def main(_):
                             "votings": votings
                         }, outputfile)
                     print("Saved sigma entropies and mu errors to %s." % save_path)
+
+                with open(os.path.join(FLAGS.save_path, "word2id.p"), "wb") as outputfile:
+                    dill.dump(word_to_id, outputfile)
+                print("Saved vocabulary to %s." % save_path)
             coord.request_stop()
             coord.join(threads, ignore_live_threads=True)
 

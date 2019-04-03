@@ -3,8 +3,7 @@ import tensorflow as tf
 import reader
 import util
 
-from configs import CUDNN, BASIC, BLOCK
-import numpy as np
+from configs import BASIC, BLOCK
 
 
 def data_type(use_fp16=False):
@@ -129,7 +128,10 @@ class PTBModel(object):
         crossent = tf.reduce_mean(crossent, axis=[0])
         return crossent
 
-    def crossentropy_loss_with_uncert(self, logits_mu, logits_sigma, y_true):
+    def crossentropy_loss_with_uncert(self, logits_mu, logits_sigma, y_true, training):
+        num_samples = self.num_samples
+        if not training:
+            num_samples *= 10
         epsilon = 1e-7
         batch_size = tf.shape(logits_mu)[0]
         sequence_length = tf.shape(logits_mu)[1]
@@ -149,13 +151,6 @@ class PTBModel(object):
         sample_xentropy = tf.reduce_mean(sample_xentropy, axis=0)
 
 
-        voting = tf.argmax(z, axis=-1, output_type=tf.int32)
-        voting = tf.reshape(voting, (lambda shape: (self.num_samples, -1))(tf.shape(voting)))
-        voting = tf.one_hot(voting, axis=-1, depth=2)
-        voting = tf.reduce_sum(voting, axis=0)
-        winner_classes = tf.argmax(logits_mu_flat, axis=1)
-        winner_classes = tf.one_hot(winner_classes, axis=-1, depth=2)
-        voting = tf.reduce_sum(voting * winner_classes, axis=-1)
 
         probs = tf.nn.softmax(logits_mu_flat, axis=-1)
         log_probs = tf.log(probs + epsilon)
@@ -164,6 +159,17 @@ class PTBModel(object):
         error = cross_entropy
         cross_entropy = tf.reshape(cross_entropy, [batch_size, sequence_length])
         cross_entropy = tf.reduce_mean(cross_entropy, axis=0)
+
+        if training:
+            voting = None
+        else:
+            voting = tf.argmax(z, axis=-1, output_type=tf.int32)
+            voting = tf.reshape(voting, (lambda shape: (self.num_samples, -1))(tf.shape(voting)))
+            voting = tf.one_hot(voting, axis=-1, depth=2)
+            voting = tf.reduce_sum(voting, axis=0)
+            winner_classes = tf.argmax(logits_mu_flat, axis=1)
+            winner_classes = tf.one_hot(winner_classes, axis=-1, depth=2)
+            voting = tf.reduce_sum(voting * winner_classes, axis=-1)
         return cross_entropy, sample_xentropy, probs, error, mu_entropy, voting
 
     def _build_rnn_graph(self, inputs, config, is_training):
