@@ -161,7 +161,7 @@ class PTBModel(object):
         cross_entropy = tf.reduce_mean(cross_entropy, axis=0)
 
         if training:
-            voting = None
+            voting = error
         else:
             voting = tf.argmax(z, axis=-1, output_type=tf.int32)
             voting = tf.reshape(voting, (lambda shape: (self.num_samples, -1))(tf.shape(voting)))
